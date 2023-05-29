@@ -37,7 +37,6 @@ var (
 	songQueue       []Song
 	isPlaying       bool
 	queue           []string
-	loop            bool = false
 	disconnectTimer *time.Timer
 )
 
@@ -94,7 +93,6 @@ func Start() {
 	BotID = user.ID
 
 	session.AddHandler(playHandler)
-	session.AddHandler(loopCommandHandler)
 	session.AddHandler(shuffleCommandHandler)
 
 	err = session.Open()
@@ -143,16 +141,6 @@ func playHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 			if err != nil {
 				log.Fatalf("Error playing sound: %v", err)
 			}
-		}
-	}
-}
-
-func loopCommandHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if m.Content == "&loop" {
-		loop = !loop
-		_, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Looping is now %v.", loop))
-		if err != nil {
-			return
 		}
 	}
 }
@@ -253,8 +241,8 @@ func playMusic(s *discordgo.Session, m *discordgo.MessageCreate, guildId, channe
 
 func playNextSong(s *discordgo.Session, m *discordgo.MessageCreate) {
 	isPlaying = true
-
 	song := songQueue[0]
+	songQueue = songQueue[1:]
 	audioFile := "audio.mp3"
 
 	vc, err := s.ChannelVoiceJoin(song.guildId, song.channelID, false, true)
@@ -270,7 +258,7 @@ func playNextSong(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	_, err = s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Now playing: %v.", song.youtubeURL))
+	_, err = s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Now playing: %v", song.youtubeURL))
 	if err != nil {
 		return
 	}
@@ -297,14 +285,6 @@ func playNextSong(s *discordgo.Session, m *discordgo.MessageCreate) {
 			return
 		}
 	})
-
-	if !loop {
-		songQueue = songQueue[1:]
-	}
-
-	if loop {
-		songQueue = append(songQueue, song)
-	}
 
 	if len(songQueue) > 0 {
 		playNextSong(s, m)
