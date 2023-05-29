@@ -5,12 +5,15 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"github.com/bwmarrin/discordgo"
 	"google.golang.org/api/option"
 	"google.golang.org/api/youtube/v3"
 	"io"
 	"layeh.com/gopus"
 	"log"
+	"math/rand"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -18,12 +21,7 @@ import (
 )
 
 func main() {
-	err := GetConfig()
-	if err != nil {
-		log.Printf("Error getting config: %v", err)
-		return
-	}
-
+	GetConfig()
 	Start()
 
 	<-make(chan struct{})
@@ -38,6 +36,8 @@ var (
 	BotID           string
 	songQueue       []Song
 	isPlaying       bool
+	queue           []string
+	loop            bool = false
 	disconnectTimer *time.Timer
 )
 
@@ -53,33 +53,33 @@ type Song struct {
 	youtubeURL string
 }
 
-func GetConfig() error {
-	log.Printf("Received request to get configuration...")
+func GetConfig() {
+	log.Printf("Reading configuration...")
 
 	file, err := os.ReadFile("./config.json")
 	if err != nil {
 		log.Printf("Couldn't get configuration: %v", err)
-		return err
+		return
 	}
 
 	err = json.Unmarshal(file, &config)
 
 	if err != nil {
 		log.Printf("Couldn't get configuration: %v", err)
-		return err
+		return
 	}
 
 	Token = config.Token
 	BotPrefix = config.BotPrefix
 	APIKey = config.APIKey
 
-	log.Printf("Configuration loaded succesfuly!")
+	log.Printf("Configuration loaded succesfuly.")
 
-	return nil
+	return
 }
 
 func Start() {
-	session, err := discordgo.New("Bot " + config.Token)
+	session, err := discordgo.New("Bot " + Token)
 	if err != nil {
 		log.Printf("Couldn't initialize bot: %v", err)
 		return
@@ -93,7 +93,9 @@ func Start() {
 
 	BotID = user.ID
 
-	session.AddHandler(messageHandler)
+	session.AddHandler(playHandler)
+	session.AddHandler(loopCommandHandler)
+	session.AddHandler(shuffleCommandHandler)
 
 	err = session.Open()
 	if err != nil {
@@ -104,7 +106,7 @@ func Start() {
 	log.Printf("Bot initialized successfuly!")
 }
 
-func messageHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
+func playHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if m.Author.ID == BotID {
 		return
 	}
@@ -112,17 +114,56 @@ func messageHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 	guild, _ := s.State.Guild(m.GuildID)
 	channelID := m.ChannelID
 
-	if m.Content == "sus" {
-		_, _ = s.ChannelMessageSend(m.ChannelID, "muy sus")
-	}
-
 	if strings.Contains(m.Content, "&play") {
 		searchQuery := strings.TrimPrefix(m.Content, "&play")
 
-		youtubeURL, err := fetchYoutubeUrl(searchQuery)
-		err = playMusic(s, guild.ID, channelID, youtubeURL)
+		var youtubeURL string
+		var err error
+
+		if strings.Contains(searchQuery, "list=") {
+			youtubeURLs, err := fetchYoutubePlaylist(searchQuery)
+			if err != nil {
+				log.Printf("Error fetching playlist: %v", err)
+				return
+			}
+			queue = append(queue, youtubeURLs...)
+		} else {
+			youtubeURL, err = fetchYoutubeUrl(searchQuery)
+			if err != nil {
+				log.Printf("Error fetching video: %v", err)
+				return
+			}
+			queue = append(queue, youtubeURL)
+		}
+
+		for len(queue) > 0 {
+			youtubeURL := queue[0]
+			queue = queue[1:]
+			err = playMusic(s, m, guild.ID, channelID, youtubeURL)
+			if err != nil {
+				log.Fatalf("Error playing sound: %v", err)
+			}
+		}
+	}
+}
+
+func loopCommandHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if m.Content == "&loop" {
+		loop = !loop
+		_, err := s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Looping is now %v.", loop))
 		if err != nil {
-			log.Printf("Error playing sound: %v", err)
+			return
+		}
+	}
+}
+
+func shuffleCommandHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if m.Content == "&shuffle" {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		r.Shuffle(len(songQueue), func(i, j int) { songQueue[i], songQueue[j] = songQueue[j], songQueue[i] })
+		_, err := s.ChannelMessageSend(m.ChannelID, "Song queue has been shuffled.")
+		if err != nil {
+			return
 		}
 	}
 }
@@ -157,31 +198,80 @@ func fetchYoutubeUrl(searchQuery string) (string, error) {
 	return videoURL, nil
 }
 
-func playMusic(s *discordgo.Session, guildId, channelID, youtubeURL string) error {
+func fetchYoutubePlaylist(playlistUrl string) ([]string, error) {
+	ctx := context.Background()
+
+	service, err := youtube.NewService(ctx, option.WithAPIKey(APIKey))
+	if err != nil {
+		log.Printf("Error creating Youtube client: %v", err)
+		return nil, err
+	}
+
+	u, err := url.Parse(playlistUrl)
+	if err != nil {
+		log.Printf("Error parsing playlist URL: %v", err)
+		return nil, err
+	}
+
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		log.Printf("Error parsing playlist URL query: %v", err)
+		return nil, err
+	}
+
+	playlistId := q.Get("list")
+	if playlistId == "" {
+		return nil, errors.New("invalid playlist URL")
+	}
+
+	call := service.PlaylistItems.List([]string{"contentDetails"}).PlaylistId(playlistId).MaxResults(50)
+
+	var videoUrls []string
+	err = call.Pages(ctx, func(page *youtube.PlaylistItemListResponse) error {
+		for _, item := range page.Items {
+			videoId := item.ContentDetails.VideoId
+			videoUrls = append(videoUrls, "https://www.youtube.com/watch?v="+videoId)
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("Error fetching playlist items: %v", err)
+		return nil, err
+	}
+
+	return videoUrls, nil
+}
+
+func playMusic(s *discordgo.Session, m *discordgo.MessageCreate, guildId, channelID, youtubeURL string) error {
 	songQueue = append(songQueue, Song{guildId: guildId, channelID: channelID, youtubeURL: youtubeURL})
-	log.Printf("Added song to list!")
 	if !isPlaying {
-		go playNextSong(s)
+		go playNextSong(s, m)
 	}
 	return nil
 }
 
-func playNextSong(s *discordgo.Session) {
+func playNextSong(s *discordgo.Session, m *discordgo.MessageCreate) {
 	isPlaying = true
-	song := songQueue[0]
-	songQueue = songQueue[1:]
 
+	song := songQueue[0]
 	audioFile := "audio.mp3"
+
+	vc, err := s.ChannelVoiceJoin(song.guildId, song.channelID, false, true)
+	if err != nil {
+		log.Printf("Failed to join voice channel: %v", err)
+		return
+	}
+
 	cmd := exec.Command("youtube-dl", "-x", "--audio-format", "mp3", "-o", audioFile, song.youtubeURL)
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		log.Printf("Failed to download audio: %v", err)
 		return
 	}
 
-	vc, err := s.ChannelVoiceJoin(song.guildId, song.channelID, false, true)
+	_, err = s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Now playing: %v.", song.youtubeURL))
 	if err != nil {
-		log.Printf("Failed to join voice channel: %v", err)
 		return
 	}
 
@@ -191,7 +281,10 @@ func playNextSong(s *discordgo.Session) {
 		return
 	}
 
-	removeAudioFile()
+	err = os.Remove("audio.mp3")
+	if err != nil {
+		log.Printf("Failed to delete audio file: %v", err)
+	}
 
 	if disconnectTimer != nil {
 		disconnectTimer.Stop()
@@ -205,8 +298,16 @@ func playNextSong(s *discordgo.Session) {
 		}
 	})
 
+	if !loop {
+		songQueue = songQueue[1:]
+	}
+
+	if loop {
+		songQueue = append(songQueue, song)
+	}
+
 	if len(songQueue) > 0 {
-		playNextSong(s)
+		playNextSong(s, m)
 	} else {
 		isPlaying = false
 	}
@@ -255,11 +356,4 @@ func playAudioFile(vc *discordgo.VoiceConnection, filename string) error {
 	}
 
 	return nil
-}
-
-func removeAudioFile() {
-	err := os.Remove("audio.mp3")
-	if err != nil {
-		log.Printf("Failed to delete audio file: %v", err)
-	}
 }
