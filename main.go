@@ -20,12 +20,16 @@ import (
 	"time"
 )
 
-func main() {
-	GetConfig()
-	Start()
+type configStruct struct {
+	Token     string `json:"token"`
+	BotPrefix string `json:"botPrefix"`
+	APIKey    string `json:"APIKey"`
+}
 
-	<-make(chan struct{})
-	return
+type Song struct {
+	guildId    string
+	channelID  string
+	youtubeURL string
 }
 
 var (
@@ -40,16 +44,38 @@ var (
 	disconnectTimer *time.Timer
 )
 
-type configStruct struct {
-	Token     string `json:"token"`
-	BotPrefix string `json:"botPrefix"`
-	APIKey    string `json:"APIKey"`
+func main() {
+	GetConfig()
+	Start()
+
+	<-make(chan struct{})
+	return
 }
 
-type Song struct {
-	guildId    string
-	channelID  string
-	youtubeURL string
+func Start() {
+	session, err := discordgo.New("Bot " + Token)
+	if err != nil {
+		log.Printf("Couldn't initialize bot: %v", err)
+		return
+	}
+
+	user, err := session.User("@me")
+	if err != nil {
+		log.Printf("Error getting user: %v", err)
+		return
+	}
+
+	BotID = user.ID
+
+	session.AddHandler(messageHandler)
+
+	err = session.Open()
+	if err != nil {
+		log.Printf("Error creating session: %v", err)
+		return
+	}
+
+	log.Printf("Bot initialized successfuly. 👾")
 }
 
 func GetConfig() {
@@ -77,34 +103,9 @@ func GetConfig() {
 	return
 }
 
-func Start() {
-	session, err := discordgo.New("Bot " + Token)
-	if err != nil {
-		log.Printf("Couldn't initialize bot: %v", err)
-		return
-	}
-
-	user, err := session.User("@me")
-	if err != nil {
-		log.Printf("Error getting user: %v", err)
-		return
-	}
-
-	BotID = user.ID
-
-	session.AddHandler(playHandler)
-	session.AddHandler(shuffleCommandHandler)
-
-	err = session.Open()
-	if err != nil {
-		log.Printf("Error creating session: %v", err)
-		return
-	}
-
-	log.Printf("Bot initialized successfuly!")
-}
-
-func playHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
+// Handlers
+func messageHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
+	// &play commands
 	if m.Author.ID == BotID {
 		return
 	}
@@ -143,9 +144,8 @@ func playHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 			}
 		}
 	}
-}
 
-func shuffleCommandHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
+	// &shuffle commands
 	if m.Content == "&shuffle" {
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
 		r.Shuffle(len(songQueue), func(i, j int) { songQueue[i], songQueue[j] = songQueue[j], songQueue[i] })
@@ -156,6 +156,7 @@ func shuffleCommandHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 }
 
+// Audio utils.
 func fetchYoutubeUrl(searchQuery string) (string, error) {
 	ctx := context.Background()
 
