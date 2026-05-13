@@ -1,6 +1,4 @@
 {
-  "Token": "<YOUR_DISCORD_BOT_TOKEN>",
-  "BotPrefix": "<YOUR_COMMAND_PREFIX>",
-  "PermissionsInteger": "<YOUR_PERMISSION_INTEGER>",
+  "token": "<YOUR_DISCORD_BOT_TOKEN>",
   "APIKey": "<YOUR_YOUTUBE_API_KEY>"
 }

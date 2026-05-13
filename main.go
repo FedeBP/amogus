@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -33,13 +34,29 @@ type configStruct struct {
 	APIKey    string `json:"APIKey"`
 }
 
+type cachedSearch struct {
+	results []SearchResult
+	expires time.Time
+}
+
 var (
 	Token     string
 	BotPrefix string
 	APIKey    string
 	config    *configStruct
 	BotID     string
+	searchCache = map[string]cachedSearch{}
+	searchCacheMu sync.Mutex
 )
+
+var searchHTTP = &http.Client{
+    Timeout: 2 * time.Second,
+    Transport: &http.Transport{
+        MaxIdleConns:        100,
+        MaxIdleConnsPerHost: 100,
+        IdleConnTimeout:     90 * time.Second,
+    },
+}
 
 func GetConfig() {
 	log.Printf("Reading configuration...")
@@ -82,10 +99,24 @@ func GetConfig() {
 // Per-guild state
 // ---------------------------------------------------------------------------
 
+type Track struct {
+	URL      string
+	Title    string
+	Artist   string
+	Duration string
+}
+
 type Song struct {
 	guildID    string
 	channelID  string
-	youtubeURL string
+	track Track
+}
+
+type SearchResult struct {
+    Title    string `json:"title"`
+    Artist   string `json:"artist"`
+    VideoID  string `json:"videoId"`
+    Duration string `json:"duration"`
 }
 
 // guildState holds all mutable playback state for one Discord server.
@@ -176,7 +207,7 @@ const (
 var slashCommands = []*discordgo.ApplicationCommand{
 	{
 		Name:        "play",
-		Description: "Play from YouTube Music — search or paste a URL / playlist",
+		Description: "Play music from YouTube Music",
 		Options: []*discordgo.ApplicationCommandOption{
 			{
 				Type:         discordgo.ApplicationCommandOptionString,
@@ -215,7 +246,6 @@ func Start() {
 		discordgo.IntentsGuildVoiceStates |
 		discordgo.IntentsMessageContent
 
-	session.AddHandler(messageHandler)
 	session.AddHandler(botVoiceStateHandler)
 	session.AddHandler(interactionHandler)
 	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
@@ -318,82 +348,148 @@ func ytDownloaderPath() (string, error) {
 	return "", errors.New("yt-dlp not found in PATH")
 }
 
-// fetchYouTubeURL resolves a search query or direct URL to a playable watch URL.
-//
-// For text searches it uses yt-dlp's ytmsearch: extractor, which queries
-// YouTube Music directly. This returns audio tracks instead of music videos,
-// skipping intros, outros, and unrelated content, and eliminates the YouTube
-// Data API quota cost for every play command.
-//
-// Direct URLs (any recognised YouTube host) bypass search entirely.
-func fetchYouTubeURL(ctx context.Context, query string) (string, error) {
+func resolveTrack(ctx context.Context, query string) (Track, error) {
 	query = strings.TrimSpace(query)
+
 	if query == "" {
-		return "", errors.New("empty query")
-	}
-	if id := extractYouTubeVideoID(query); id != "" {
-		return "https://www.youtube.com/watch?v=" + id, nil
+		return Track{}, errors.New("empty query")
 	}
 
-	dl, err := ytDownloaderPath()
+	// Direct URL handling
+	if id := extractYouTubeVideoID(query); id != "" {
+		return Track{
+			URL: "https://www.youtube.com/watch?v=" + id,
+		}, nil
+	}
+
+	results, err := ytMusicSearch(ctx, query)
+	if err != nil {
+		return Track{}, err
+	}
+
+	if len(results) == 0 {
+		return Track{}, errors.New("no suitable results found")
+	}
+
+	first := results[0]
+
+	return Track{
+		URL:      "https://www.youtube.com/watch?v=" + first.VideoID,
+		Title:    first.Title,
+		Artist:   first.Artist,
+		Duration: first.Duration,
+	}, nil
+}
+
+// ytMusicSearch uses a Python script to search YouTube Music and return a list of search results.
+func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
+	searchCacheMu.Lock()
+
+	if cached, ok := searchCache[query]; ok {
+		if time.Now().Before(cached.expires) {
+			searchCacheMu.Unlock()
+			return cached.results, nil
+		}
+	}
+	
+	searchCacheMu.Unlock()
+
+	url := "http://127.0.0.1:5000/search?q=" + url.QueryEscape(query)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := searchHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var results []SearchResult
+
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+
+	searchCacheMu.Lock()
+	searchCache[query] = cachedSearch{
+		results: results,
+		expires: time.Now().Add(10 * time.Minute),
+	}
+	searchCacheMu.Unlock()
+
+	return results, nil
+}
+
+// ytMusicFirstResult uses a Python script to search YouTube Music and return the first search result.
+func ytMusicFirstResult(ctx context.Context, query string) (string, error) {
+	url := "http://127.0.0.1:5000/first?q=" + url.QueryEscape(query)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", err
 	}
 
-	// ytmsearch1: returns the top YouTube Music result.
-	// --get-id prints just the video ID without downloading anything (~0.5-1 s).
-	cmd := exec.CommandContext(ctx, dl,
-		"--get-id",
-		"--no-playlist",
-		"ytmsearch1:"+query,
-	)
-	out, err := cmd.Output()
+	resp, err := searchHTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("ytmsearch: %w", err)
+		return "", err
 	}
-	id := strings.TrimSpace(string(out))
-	if id == "" {
-		return "", errors.New("no results from YouTube Music search")
+	defer resp.Body.Close()
+
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
 	}
-	return "https://www.youtube.com/watch?v=" + id, nil
+
+	return strings.TrimSpace(string(out)), nil
 }
 
-// youtubeAutocompleteChoices returns up to 25 slash autocomplete options using
-// the YouTube Data API (kept only here for its rich title+channel metadata).
-func youtubeAutocompleteChoices(ctx context.Context, query string) ([]*discordgo.ApplicationCommandOptionChoice, error) {
-	query = strings.TrimSpace(query)
-	if len([]rune(query)) < 2 {
-		return []*discordgo.ApplicationCommandOptionChoice{}, nil
-	}
-	service, err := youtube.NewService(ctx, option.WithAPIKey(APIKey))
-	if err != nil {
-		return nil, err
-	}
-	response, err := service.Search.List([]string{"id", "snippet"}).
-		Q(query).Type("video").MaxResults(25).Context(ctx).Do()
-	if err != nil {
-		return nil, err
-	}
-	if response == nil || len(response.Items) == 0 {
-		return []*discordgo.ApplicationCommandOptionChoice{}, nil
-	}
-	out := make([]*discordgo.ApplicationCommandOptionChoice, 0, len(response.Items))
-	for _, item := range response.Items {
-		if item.Id == nil || item.Id.Kind != "youtube#video" || item.Id.VideoId == "" || item.Snippet == nil {
-			continue
-		}
-		title := strings.TrimSpace(item.Snippet.Title)
-		ch := strings.TrimSpace(item.Snippet.ChannelTitle)
-		label := title
-		if ch != "" {
-			label = title + " · " + ch
-		}
-		out = append(out, &discordgo.ApplicationCommandOptionChoice{
-			Name:  truncateChoiceLabel(label, discordChoiceNameMax),
-			Value: "https://www.youtube.com/watch?v=" + item.Id.VideoId,
-		})
-	}
-	return out, nil
+// youtubeAutocompleteChoices uses a Python script to search YouTube Music and return a list of autocomplete choices.
+func youtubeAutocompleteChoices(
+    ctx context.Context,
+    query string,
+) ([]*discordgo.ApplicationCommandOptionChoice, error) {
+
+    query = strings.TrimSpace(query)
+
+    if len([]rune(query)) < 2 {
+        return []*discordgo.ApplicationCommandOptionChoice{}, nil
+    }
+
+    results, err := ytMusicSearch(ctx, query)
+    if err != nil {
+        return nil, err
+    }
+
+    choices := make([]*discordgo.ApplicationCommandOptionChoice, 0)
+
+    for _, r := range results {
+        if r.VideoID == "" {
+            continue
+        }
+
+        label := r.Title
+
+        if r.Artist != "" {
+            label += " · " + r.Artist
+        }
+
+        if r.Duration != "" {
+            label += " [" + r.Duration + "]"
+        }
+
+        choices = append(
+            choices,
+            &discordgo.ApplicationCommandOptionChoice{
+                Name: truncateChoiceLabel(label, discordChoiceNameMax),
+                Value: "https://www.youtube.com/watch?v=" + r.VideoID,
+            },
+        )
+    }
+
+    return choices, nil
 }
 
 func truncateChoiceLabel(s string, max int) string {
@@ -434,8 +530,15 @@ func fetchPlaylistEnqueue(ctx context.Context, s *discordgo.Session, guildID, te
 			if total >= maxPlaylistTracks {
 				return errPlaylistMaxSize
 			}
-			_ = enqueueURL(s, guildID, textChannelID, voiceChannelID,
-				"https://www.youtube.com/watch?v="+item.ContentDetails.VideoId)
+			_ = enqueueTrack(
+				s,
+				guildID,
+				textChannelID,
+				voiceChannelID,
+				Track{
+					URL: "https://www.youtube.com/watch?v=" + item.ContentDetails.VideoId,
+				},
+			)
 			total++
 		}
 		return nil
@@ -470,29 +573,51 @@ func runPlayFlow(ctx context.Context, s *discordgo.Session, guildID, textChannel
 		return fmt.Sprintf("Queued %d tracks.", n)
 	}
 
-	videoURL, err := fetchYouTubeURL(ctx, query)
+	track, err := resolveTrack(ctx, query)
 	if err != nil {
-		log.Printf("search: %v", err)
-		return fmt.Sprintf("Could not find a video: %v", err)
+		return fmt.Sprintf("Could not find a track: %v", err)
 	}
-	_ = enqueueURL(s, guildID, textChannelID, voiceChannelID, videoURL)
+	_ = enqueueTrack(
+		s,
+		guildID,
+		textChannelID,
+		voiceChannelID,
+		track,
+	)
+	
 	return ""
 }
 
-// enqueueURL adds a song to the guild queue and starts the playback goroutine
-// if nothing is currently playing.
-func enqueueURL(s *discordgo.Session, guildID, textChannelID, voiceChannelID, youtubeURL string) error {
+func enqueueTrack(
+	s *discordgo.Session,
+	guildID,
+	textChannelID,
+	voiceChannelID string,
+	track Track,
+) error {
+
 	gs := getGuildState(guildID)
+
 	gs.mu.Lock()
-	gs.songQueue = append(gs.songQueue, Song{guildID: guildID, channelID: voiceChannelID, youtubeURL: youtubeURL})
+
+	gs.songQueue = append(gs.songQueue, Song{
+		guildID:   guildID,
+		channelID: voiceChannelID,
+		track:     track,
+	})
+
 	shouldStart := !gs.isPlaying
+
 	if shouldStart {
 		gs.isPlaying = true
 	}
+
 	gs.mu.Unlock()
+
 	if shouldStart {
 		go playNextSong(s, guildID, textChannelID)
 	}
+
 	return nil
 }
 
@@ -554,9 +679,35 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 			return
 		}
 
-		_, _ = s.ChannelMessageSend(textChannelID, fmt.Sprintf("Now playing: %v", song.youtubeURL))
+		description := song.track.URL
 
-		if err := streamAudio(gs, vc, dl, song.youtubeURL, opusEncoder); err != nil {
+		if song.track.Title != "" {
+			description = fmt.Sprintf(
+				"**%s**",
+				song.track.Title,
+			)
+
+			if song.track.Artist != "" {
+				description += "\n" + song.track.Artist
+			}
+
+			if song.track.Duration != "" {
+				description += "\nDuration: " + song.track.Duration
+			}
+		}
+
+		embed := &discordgo.MessageEmbed{
+			Title:       "🎵 Now Playing",
+			Description: description,
+			URL:         song.track.URL,
+		}
+
+		_, _ = s.ChannelMessageSendEmbed(
+			textChannelID,
+			embed,
+		)
+
+		if err := streamAudio(gs, vc, dl, song.track.URL, opusEncoder); err != nil {
 			if gs.skipInterrupt.Load() {
 				gs.skipInterrupt.Store(false)
 				_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
@@ -696,69 +847,6 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		return fmt.Errorf("ffmpeg exit: %w", err)
 	}
 	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Message handler
-// ---------------------------------------------------------------------------
-
-func messageHandler(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if m.Author.ID == BotID {
-		return
-	}
-	norm := strings.TrimSpace(m.Content)
-
-	switch {
-	case norm == "&skip" || norm == "&next":
-		getGuildState(m.GuildID).interruptPlayback()
-
-	case norm == "&stop":
-		gs := getGuildState(m.GuildID)
-		gs.resetPlaybackState()
-		s.RLock()
-		vc, ok := s.VoiceConnections[m.GuildID]
-		s.RUnlock()
-		if ok && vc != nil {
-			gs.intentionalLeave.Store(true)
-			_ = vc.Disconnect()
-		}
-		_, _ = s.ChannelMessageSend(m.ChannelID, "Stopped playback and cleared the queue.")
-
-	case norm == "&shuffle":
-		gs := getGuildState(m.GuildID)
-		gs.mu.Lock()
-		n := len(gs.songQueue)
-		if n > 1 {
-			rngMu.Lock()
-			rng.Shuffle(n, func(i, j int) { gs.songQueue[i], gs.songQueue[j] = gs.songQueue[j], gs.songQueue[i] })
-			rngMu.Unlock()
-		}
-		gs.mu.Unlock()
-		_, _ = s.ChannelMessageSend(m.ChannelID, "Queue shuffled.")
-
-	case strings.Contains(norm, "&play"):
-		voiceChID, err := voiceChannelForUser(s, m.GuildID, m.Author.ID)
-		if err != nil {
-			msg := "Join a voice channel first, then use `&play`."
-			if !errors.Is(err, errNotInVoice) {
-				msg = "Could not read server state. Try again in a moment."
-			}
-			_, _ = s.ChannelMessageSend(m.ChannelID, msg)
-			return
-		}
-		go func() {
-			query := strings.TrimSpace(norm[strings.Index(norm, "&play")+len("&play"):])
-			if query == "" {
-				_, _ = s.ChannelMessageSend(m.ChannelID, "Usage: `&play <search or URL>`")
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
-			defer cancel()
-			if msg := runPlayFlow(ctx, s, m.GuildID, m.ChannelID, voiceChID, query); msg != "" {
-				_, _ = s.ChannelMessageSend(m.ChannelID, msg)
-			}
-		}()
-	}
 }
 
 // ---------------------------------------------------------------------------
