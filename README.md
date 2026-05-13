@@ -1,38 +1,34 @@
 # amogus
 
-A Discord bot written in **Go** that plays audio from **YouTube** in voice channels (search, direct URLs, and playlists via the YouTube Data API). Respect copyright, YouTube’s Terms of Service, and your local laws. This project is for personal/educational use.
+A Discord music bot written in Go. It plays YouTube / YouTube Music audio in voice channels through slash commands, with search and autocomplete powered by a small Python YTMusic sidecar.
 
----
+The audio path streams directly:
 
-## Dependencies
+```text
+yt-dlp stdout -> ffmpeg libopus OGG stdout -> OGG demux -> Discord OpusSend
+```
 
-### Runtime
+There is no Go-side PCM decode/encode step anymore, and the project no longer depends on `layeh.com/gopus`.
 
-| Requirement | Notes |
-|-------------|--------|
-| **Go 1.22+** | Matches `go.mod` / toolchain. Run `go version`. |
-| **CGO enabled + C compiler** | Required by [`layeh.com/gopus`](https://layeh.com/gopus) (Opus encoding). On Windows install a MinGW-w64 toolchain (e.g. [WinLibs](https://winlibs.com/) via `winget install BrechtSanders.WinLibs.POSIX.UCRT`) so `gcc` is on `PATH`. |
-| **yt-dlp** (preferred) or **youtube-dl** | Downloads/extracts audio. Example: `winget install yt-dlp.yt-dlp`. |
-| **ffmpeg** | Decodes audio for streaming to Discord. Example: `winget install Gyan.FFmpeg`. |
+Respect copyright, YouTube's Terms of Service, and your local laws. This project is for personal/educational use.
 
-After installing tools on Windows, **open a new terminal** (or refresh `PATH`) so `gcc`, `yt-dlp`, and `ffmpeg` resolve.
-
-### Accounts & APIs
+## Requirements
 
 | Requirement | Notes |
-|-------------|--------|
-| **Discord application / bot token** | [Discord Developer Portal](https://discord.com/developers/applications) → your app → **Bot** → token. |
-| **YouTube Data API v3 key** | [Google Cloud Console](https://console.cloud.google.com/) → enable **YouTube Data API v3** → **Credentials** → API key. |
+|-------------|-------|
+| Go 1.22+ | Matches `go.mod`. |
+| Python 3 | Runs the local YTMusic search/radio sidecar. |
+| Python packages | `flask`, `waitress`, and `ytmusicapi`. |
+| yt-dlp | Downloads/extracts source audio. `youtube-dl` is accepted as a fallback. |
+| ffmpeg | Must include `libopus`, which normal package-manager builds do. |
+| Discord bot token | From the Discord Developer Portal. |
+| YouTube Data API v3 key | Used for playlist expansion. Search/radio uses the YTMusic sidecar. |
 
-### Library note (voice / DAVE)
-
-Some Discord voice regions require **E2EE (DAVE)**. This repo uses a **`replace`** in `go.mod` to build [`discordgo`](https://github.com/bwmarrin/discordgo) from a fork that includes DAVE support. When upstream merges that work, you can remove the `replace` and use a normal `go get` on `github.com/bwmarrin/discordgo`.
-
----
+CGO, a C compiler, and `gopus` are not required for the current audio pipeline.
 
 ## Configuration
 
-Create `config.json` next to the executable (or run from the repo root so `./config.json` is found):
+Create `config.json` next to the executable, or run from the repo root:
 
 ```json
 {
@@ -45,37 +41,51 @@ Create `config.json` next to the executable (or run from the repo root so `./con
 | Field | Required | Meaning |
 |-------|----------|---------|
 | `token` | Yes | Discord bot token. |
-| `APIKey` | Yes | YouTube Data API v3 key (search + playlist expansion). |
-| `botPrefix` | Loaded but unused | Reserved; commands are fixed (`&play`, etc.). |
+| `APIKey` | Yes | YouTube Data API v3 key for playlist expansion. |
+| `botPrefix` | No | Legacy field; commands are slash commands now. |
 
-**Environment variables (recommended on servers):** if set, these override `config.json`:
+Environment variables override `config.json`:
 
 | Variable | Overrides |
 |----------|-----------|
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `YOUTUBE_API_KEY` | YouTube Data API v3 key |
-| `BOT_PREFIX` | Prefix string (optional; still mainly informational) |
+| `BOT_PREFIX` | Legacy prefix field |
 
-Keep secrets out of Git: `config.json` is listed in `.gitignore`. If it was committed before, run `git rm --cached config.json` and rotate any exposed tokens in the Discord and Google consoles.
+Keep secrets out of Git. `config.json` is ignored by this repo.
 
-### Discord application settings
+## Discord Setup
 
-1. **Bot** → enable **Message Content Intent** (needed to read `&play` text in servers).
-2. **OAuth2 → URL Generator**: scope **bot**, permissions such as **View Channels**, **Send Messages**, **Connect**, **Speak**, **Read Message History**. Invite the bot with that URL.
-3. Voice channels that enforce DAVE need a client that supports it (handled by the `discordgo` fork above).
+Invite the bot with these OAuth scopes:
 
----
+| Scope | Why |
+|-------|-----|
+| `bot` | Lets the bot join voice and send messages. |
+| `applications.commands` | Lets Discord expose slash commands. |
 
-## Build & run
+Useful bot permissions: View Channels, Send Messages, Connect, Speak, and Read Message History.
 
-From the repository root:
+The bot uses guild and voice-state gateway intents. Message Content Intent is not needed for slash commands.
+
+Some Discord voice regions require E2EE/DAVE. This repo still uses a `replace` in `go.mod` to build `discordgo` from a fork with DAVE support. When upstream ships that support, the replace can be removed.
+
+## Local Run
+
+Install the Python sidecar dependencies once:
 
 ```powershell
-# Windows: refresh PATH if gcc / yt-dlp / ffmpeg were just installed
-$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-$env:CGO_ENABLED = "1"
-$env:CGO_CFLAGS = "-O2 -Wno-stringop-overread"
+python -m pip install flask waitress ytmusicapi
+```
 
+Run the sidecar in one terminal:
+
+```powershell
+python search.py
+```
+
+Run the bot in another terminal:
+
+```powershell
 go run .
 ```
 
@@ -86,77 +96,63 @@ go build -o amogus.exe .
 ./amogus.exe
 ```
 
-- If you see `build constraints exclude all Go files` for `gopus`, **CGO is off** (`CGO_ENABLED=0`) or **`gcc` is missing from PATH**.
-- Optional: keep build logs quieter with `CGO_CFLAGS` as above.
+## Docker
 
----
-
-## Hosting (Docker, secrets, Render)
-
-This bot needs a **long-running process** (Discord gateway + voice), **ffmpeg**, **yt-dlp**, and (because of voice encoding) **CGO + libopus** at runtime.
-
-### Protecting keys
-
-Use your platform’s **encrypted environment variables** or **secret manager**—never bake tokens into the image or commit them. Set `DISCORD_BOT_TOKEN` and `YOUTUBE_API_KEY` there.
-
-### Docker
-
-From the repo root (Docker installs ffmpeg and yt-dlp inside the image):
+The Docker image builds a static Go binary, installs `ffmpeg`, `yt-dlp`, and the Python search sidecar dependencies, then starts both the sidecar and the bot.
 
 ```bash
 docker build -t amogus .
-docker run --rm -e DISCORD_BOT_TOKEN="..." -e YOUTUBE_API_KEY="..." amogus
+docker run --rm \
+  -e DISCORD_BOT_TOKEN="..." \
+  -e YOUTUBE_API_KEY="..." \
+  amogus
 ```
 
-### Render.com specifically
+Never bake tokens into the image. Use your hosting platform's secret manager or encrypted environment variables.
 
-Render’s **free web services spin down** after idle time, which **disconnects** a normal Discord bot. **Background Workers** (the usual choice for bots) are **not** on Render’s free instance type—you need a **paid** worker or another host.
+## Hosting Notes
 
-Reasonable directions:
+This bot needs a long-running process for the Discord gateway and voice connection. Free web services that sleep after idle time will disconnect the bot.
 
-- **Render**: deploy this repo as a **Background Worker** on a **paid** instance and set env vars in the dashboard (private Git repo supported).
-- **Always-free VPS**: e.g. **Oracle Cloud Free Tier** (ARM VM)—step-by-step setup is in [`docs/oracle-cloud.md`](docs/oracle-cloud.md).
-- **Other PaaS**: **Fly.io**, **Railway**, etc.—same pattern: Dockerfile + secrets in the dashboard; confirm the plan does not sleep the process.
+Reasonable options:
 
----
+| Host | Notes |
+|------|-------|
+| Render | Use a paid Background Worker. Free web services sleep. |
+| Oracle Cloud Free Tier | See [docs/oracle-cloud.md](docs/oracle-cloud.md). |
+| Fly.io / Railway / other PaaS | Use Docker and configure secrets in the dashboard. Confirm the plan does not sleep. |
 
-## Using the bot
+## Slash Commands
 
-1. **Join a voice channel** in your server.
-2. In a **text channel** the bot can read, run the commands below.
+Join a voice channel, then use the commands in a text channel where the bot can respond.
 
 | Command | Description |
 |---------|-------------|
-| `&play <query or URL>` | **Search** text, play a **single video URL**, or queue a **playlist** (`list=` in the URL). You must already be in a voice channel. Playlists resolve in pages so playback can start before the full list is fetched (cap: 200 tracks per request). |
-| `&skip` or `&next` | Skip the **current** track: stops yt-dlp download or ffmpeg playback and continues with the rest of the queue (aliases). |
-| `&shuffle` | Shuffles the internal song queue (if more than one track). |
-| `&stop` | Clears the queue, removes temporary audio files in the working directory, and disconnects from voice in that guild. |
+| `/play query:<query or URL>` | Search YouTube Music, play a single YouTube URL, or queue a playlist URL containing `list=`. Playlists resolve in pages so playback can start before the full list is fetched. Limit: 200 tracks per request. |
+| `/skip` | Skip the current track and continue with the queue. |
+| `/stop` | Stop playback, clear the queue, and disconnect from voice. |
+| `/shuffle` | Shuffle the queued tracks. |
+| `/autoplay [enabled]` | Toggle autoplay, or set it explicitly with `enabled:true` / `enabled:false`. When enabled, the bot adds a related YouTube Music radio suggestion after the queue runs out. |
 
-Commands use the **`&`** prefix in code (not `botPrefix`). Leading/trailing spaces after `&play` are OK.
+## Behavior Notes
 
-**Temporary files:** the bot writes downloads matching `audio.mp3*` in its **current working directory**. Use `&stop` or disconnect the bot from voice (see below) to clean up.
-
----
-
-## Behaviour notes
-
-- **Disconnect / kick:** If the bot is removed from voice while tracks remain, the queue is cleared and it will **not** auto-rejoin to drain the queue.
-- **Idle:** After playback, the bot disconnects from voice after **15 minutes** of inactivity (timer resets each track).
-
----
+- Playback is streamed through pipes; the bot should not create `audio.mp3*` temporary files.
+- `/autoplay` is per server and stays enabled until disabled or the process restarts.
+- Autoplay skips recently played video IDs to avoid immediately looping the same suggestions.
+- `/stop` clears playback state and prevents autoplay from requeueing after a manual stop.
+- If the bot is kicked from voice, the queue is cleared and it will not auto-rejoin.
+- After playback ends, the bot disconnects from voice after 15 minutes of inactivity.
 
 ## Troubleshooting
 
 | Problem | Things to check |
-|---------|------------------|
-| `gcc` / CGO / `gopus` errors | `CGO_ENABLED=1`, MinGW on `PATH`, new shell after install. |
-| `yt-dlp` / `ffmpeg` not found | Install both; confirm `yt-dlp --version` and `ffmpeg -version`. |
-| Voice **4017 / DAVE** | Ensure you build with the `replace` fork in `go.mod`; update when upstream ships DAVE. |
-| Bot ignores messages | Message Content Intent enabled; bot has channel permissions. |
-| Playlist errors | Use the full YouTube URL including `list=…`; API key must have **YouTube Data API v3** enabled and quota. |
-
----
+|---------|-----------------|
+| `yt-dlp` / `ffmpeg` not found | Install both and confirm `yt-dlp --version` and `ffmpeg -version`. |
+| No search/autocomplete/autoplay suggestions | Confirm `python search.py` is running on `127.0.0.1:5000` and that `flask`, `waitress`, and `ytmusicapi` are installed. |
+| Playlist errors | Use the full YouTube URL including `list=...`; the API key must have YouTube Data API v3 enabled and quota available. |
+| Voice 4017 / DAVE errors | Keep the `discordgo` replace in `go.mod` until upstream DAVE support is available. |
+| Slash commands do not appear | Reinvite with the `applications.commands` scope, then restart the bot so it bulk-overwrites command definitions. |
 
 ## License
 
-See `LICENSE` in the repository.
+See [LICENSE](LICENSE).

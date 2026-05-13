@@ -20,19 +20,23 @@ def clean_results(results):
     for r in results:
         title = r.get("title", "")
         title_lower = title.lower()
+        video_id = r.get("videoId", "")
 
+        if not video_id:
+            continue
         if any(w in title_lower for w in BAD_WORDS):
             continue
 
+        artists = r.get("artists") or []
+        artist = ""
+        if artists and isinstance(artists[0], dict):
+            artist = artists[0].get("name", "")
+
         filtered.append({
             "title": title,
-            "artist": (
-                r.get("artists", [{}])[0].get("name", "")
-                if r.get("artists")
-                else ""
-            ),
-            "videoId": r.get("videoId", ""),
-            "duration": r.get("duration", ""),
+            "artist": artist,
+            "videoId": video_id,
+            "duration": r.get("duration") or r.get("length", ""),
         })
 
     return filtered
@@ -62,6 +66,27 @@ def first():
         return ""
 
     return results[0]["videoId"]
+
+@app.route("/radio")
+def radio():
+    video_id = request.args.get("videoId", "").strip()
+
+    if not video_id:
+        return jsonify([])
+
+    try:
+        limit = int(request.args.get("limit", "25"))
+    except ValueError:
+        limit = 25
+    limit = max(1, min(limit, 50))
+
+    try:
+        playlist = yt.get_watch_playlist(videoId=video_id, limit=limit, radio=True)
+    except Exception:
+        app.logger.exception("YTMusic radio lookup failed")
+        return jsonify([])
+
+    return jsonify(clean_results(playlist.get("tracks", [])))
 
 print("YTMusic search backend started on :5000")
 

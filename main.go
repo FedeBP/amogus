@@ -70,9 +70,9 @@ func GetConfig() {
 		log.Fatalf("config.json read error: %v", err)
 	}
 
-	Token     = strings.TrimSpace(fileCfg.Token)
+	Token = strings.TrimSpace(fileCfg.Token)
 	BotPrefix = strings.TrimSpace(fileCfg.BotPrefix)
-	APIKey    = strings.TrimSpace(fileCfg.APIKey)
+	APIKey = strings.TrimSpace(fileCfg.APIKey)
 
 	if v := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN")); v != "" {
 		Token = v
@@ -132,14 +132,19 @@ type SearchResult struct {
 // guildState holds all mutable playback state for one Discord server.
 // Keeping state per-guild ensures that multiple servers never interfere.
 type guildState struct {
-	mu              sync.Mutex
-	songQueue       []Song
-	isPlaying       bool
-	disconnectTimer *time.Timer
-	activeDlCmd     *exec.Cmd
-	activeFfCmd     *exec.Cmd
-	// skipInterrupt is set to true by skip/stop to signal streamAudio to halt.
-	skipInterrupt    atomic.Bool
+	mu                 sync.Mutex
+	songQueue          []Song
+	isPlaying          bool
+	autoplayEnabled    bool
+	lastPlayed         Track
+	lastVoiceChannelID string
+	recentVideoIDs     []string
+	disconnectTimer    *time.Timer
+	activeDlCmd        *exec.Cmd
+	activeFfCmd        *exec.Cmd
+	// skipInterrupt is set to true by /skip to signal streamAudio to halt.
+	skipInterrupt      atomic.Bool
+	playbackGeneration atomic.Uint64
 	// intentionalLeave prevents botVoiceStateHandler from treating a
 	// programmatic disconnect as an external kick.
 	intentionalLeave atomic.Bool
@@ -168,13 +173,17 @@ func (gs *guildState) interruptPlayback() {
 }
 
 // resetPlaybackState clears the queue, kills active processes, and cancels
-// any pending idle-disconnect timer. Used by &stop and external kicks.
+// any pending idle-disconnect timer. Used by /stop and external kicks.
 func (gs *guildState) resetPlaybackState() {
+	gs.playbackGeneration.Add(1)
 	gs.killPlaybackProcesses()
 	gs.skipInterrupt.Store(false)
 	gs.mu.Lock()
 	gs.songQueue = nil
 	gs.isPlaying = false
+	gs.lastPlayed = Track{}
+	gs.lastVoiceChannelID = ""
+	gs.recentVideoIDs = nil
 	if gs.disconnectTimer != nil {
 		gs.disconnectTimer.Stop()
 		gs.disconnectTimer = nil
@@ -213,15 +222,18 @@ var (
 )
 
 const (
-	maxPlaylistTracks    = 200
-	discordChoiceNameMax = 100
+	maxPlaylistTracks      = 200
+	discordChoiceNameMax   = 100
+	autoplayCandidateLimit = 25
+	recentVideoMemory      = 50
 )
 
 // searchCache caches YTMusic search results for 10 minutes to avoid
 // redundant HTTP round-trips to the Python sidecar during autocomplete.
 var (
-	searchCacheMu sync.Mutex
-	searchCache   = map[string]cachedSearch{}
+	searchCacheMu      sync.Mutex
+	searchCache        = map[string]cachedSearch{}
+	trackMetadataCache = map[string]cachedTrackMetadata{}
 )
 
 type cachedSearch struct {
@@ -229,10 +241,15 @@ type cachedSearch struct {
 	expires time.Time
 }
 
+type cachedTrackMetadata struct {
+	track   Track
+	expires time.Time
+}
+
 // searchHTTP is a shared HTTP client for the Python search sidecar.
 // Using a single client reuses TCP connections across requests.
 var searchHTTP = &http.Client{
-	Timeout: 2 * time.Second,
+	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
@@ -258,9 +275,21 @@ var slashCommands = []*discordgo.ApplicationCommand{
 			},
 		},
 	},
-	{Name: "skip",    Description: "Skip the current track"},
-	{Name: "stop",    Description: "Stop playback and clear the queue"},
+	{Name: "skip", Description: "Skip the current track"},
+	{Name: "stop", Description: "Stop playback and clear the queue"},
 	{Name: "shuffle", Description: "Shuffle the queue"},
+	{
+		Name:        "autoplay",
+		Description: "Toggle related-track autoplay when the queue ends",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionBoolean,
+				Name:        "enabled",
+				Description: "Set autoplay on or off. Omit to toggle.",
+				Required:    false,
+			},
+		},
+	},
 }
 
 // ---------------------------------------------------------------------------
@@ -288,9 +317,7 @@ func Start() {
 	BotID = user.ID
 
 	session.Identify.Intents = discordgo.IntentsGuilds |
-		discordgo.IntentsGuildMessages |
-		discordgo.IntentsGuildVoiceStates |
-		discordgo.IntentsMessageContent
+		discordgo.IntentsGuildVoiceStates
 
 	session.AddHandler(botVoiceStateHandler)
 	session.AddHandler(interactionHandler)
@@ -396,6 +423,55 @@ func extractYouTubeVideoID(s string) string {
 	return ""
 }
 
+func trackVideoID(t Track) string {
+	return extractYouTubeVideoID(t.URL)
+}
+
+func trackFromSearchResult(r SearchResult) Track {
+	return Track{
+		URL:      "https://www.youtube.com/watch?v=" + r.VideoID,
+		Title:    r.Title,
+		Artist:   r.Artist,
+		Duration: r.Duration,
+	}
+}
+
+// rememberTrackLocked records recently played video IDs so autoplay does not
+// immediately loop the same few recommendations. The caller must hold gs.mu.
+func (gs *guildState) rememberTrackLocked(t Track) {
+	id := trackVideoID(t)
+	if id == "" {
+		return
+	}
+	if len(gs.recentVideoIDs) > 0 && gs.recentVideoIDs[len(gs.recentVideoIDs)-1] == id {
+		return
+	}
+	gs.recentVideoIDs = append(gs.recentVideoIDs, id)
+	if len(gs.recentVideoIDs) > recentVideoMemory {
+		gs.recentVideoIDs = gs.recentVideoIDs[len(gs.recentVideoIDs)-recentVideoMemory:]
+	}
+}
+
+// autoplayExclusionsLocked returns video IDs already played recently or queued.
+// The caller must hold gs.mu.
+func (gs *guildState) autoplayExclusionsLocked() map[string]struct{} {
+	excluded := make(map[string]struct{}, len(gs.recentVideoIDs)+len(gs.songQueue)+1)
+	for _, id := range gs.recentVideoIDs {
+		if id != "" {
+			excluded[id] = struct{}{}
+		}
+	}
+	if id := trackVideoID(gs.lastPlayed); id != "" {
+		excluded[id] = struct{}{}
+	}
+	for _, song := range gs.songQueue {
+		if id := trackVideoID(song.track); id != "" {
+			excluded[id] = struct{}{}
+		}
+	}
+	return excluded
+}
+
 // ytDownloaderPath returns the absolute path of yt-dlp (preferred) or
 // youtube-dl, whichever is found first on PATH.
 func ytDownloaderPath() (string, error) {
@@ -411,6 +487,33 @@ func ytDownloaderPath() (string, error) {
 // Search / track resolution
 // ---------------------------------------------------------------------------
 
+func cacheTrackMetadataLocked(results []SearchResult, expires time.Time) {
+	for _, r := range results {
+		if r.VideoID == "" {
+			continue
+		}
+		trackMetadataCache[r.VideoID] = cachedTrackMetadata{
+			track:   trackFromSearchResult(r),
+			expires: expires,
+		}
+	}
+}
+
+func cachedTrackByVideoID(videoID string) (Track, bool) {
+	searchCacheMu.Lock()
+	defer searchCacheMu.Unlock()
+
+	cached, ok := trackMetadataCache[videoID]
+	if !ok {
+		return Track{}, false
+	}
+	if time.Now().After(cached.expires) {
+		delete(trackMetadataCache, videoID)
+		return Track{}, false
+	}
+	return cached.track, true
+}
+
 // resolveTrack turns a raw query string into a playable Track.
 //
 //   - If query is a YouTube URL, the video ID is extracted directly.
@@ -423,6 +526,9 @@ func resolveTrack(ctx context.Context, query string) (Track, error) {
 	}
 
 	if id := extractYouTubeVideoID(query); id != "" {
+		if track, ok := cachedTrackByVideoID(id); ok {
+			return track, nil
+		}
 		return Track{URL: "https://www.youtube.com/watch?v=" + id}, nil
 	}
 
@@ -435,12 +541,7 @@ func resolveTrack(ctx context.Context, query string) (Track, error) {
 	}
 
 	r := results[0]
-	return Track{
-		URL:      "https://www.youtube.com/watch?v=" + r.VideoID,
-		Title:    r.Title,
-		Artist:   r.Artist,
-		Duration: r.Duration,
-	}, nil
+	return trackFromSearchResult(r), nil
 }
 
 // ytMusicSearch queries the Python search sidecar for up to 5 song results.
@@ -465,20 +566,84 @@ func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("search sidecar status %s", resp.Status)
+	}
 
 	var results []SearchResult
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		return nil, err
 	}
 
+	expires := time.Now().Add(10 * time.Minute)
 	searchCacheMu.Lock()
 	searchCache[query] = cachedSearch{
 		results: results,
-		expires: time.Now().Add(10 * time.Minute),
+		expires: expires,
 	}
+	cacheTrackMetadataLocked(results, expires)
 	searchCacheMu.Unlock()
 
 	return results, nil
+}
+
+// ytMusicRadio asks the Python sidecar for YouTube Music radio suggestions
+// based on a seed video ID.
+func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResult, error) {
+	videoID = strings.TrimSpace(videoID)
+	if videoID == "" {
+		return nil, errors.New("empty seed video ID")
+	}
+
+	params := url.Values{}
+	params.Set("videoId", videoID)
+	params.Set("limit", fmt.Sprint(limit))
+
+	reqURL := "http://127.0.0.1:5000/radio?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := searchHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("radio sidecar status %s", resp.Status)
+	}
+
+	var results []SearchResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return nil, err
+	}
+	searchCacheMu.Lock()
+	cacheTrackMetadataLocked(results, time.Now().Add(10*time.Minute))
+	searchCacheMu.Unlock()
+	return results, nil
+}
+
+func resolveAutoplayTrack(ctx context.Context, seed Track, excluded map[string]struct{}) (Track, error) {
+	seedID := trackVideoID(seed)
+	if seedID == "" {
+		return Track{}, errors.New("last track has no YouTube video ID")
+	}
+
+	results, err := ytMusicRadio(ctx, seedID, autoplayCandidateLimit)
+	if err != nil {
+		return Track{}, err
+	}
+	for _, r := range results {
+		if r.VideoID == "" {
+			continue
+		}
+		if _, seen := excluded[r.VideoID]; seen {
+			continue
+		}
+		return trackFromSearchResult(r), nil
+	}
+	return Track{}, errors.New("no unused radio suggestions found")
 }
 
 // youtubeAutocompleteChoices returns Discord autocomplete choices for the
@@ -620,13 +785,18 @@ func enqueueTrack(s *discordgo.Session, guildID, textChannelID, voiceChannelID s
 		track:     track,
 	})
 	shouldStart := !gs.isPlaying
+	generation := gs.playbackGeneration.Load()
 	if shouldStart {
 		gs.isPlaying = true
+		if gs.disconnectTimer != nil {
+			gs.disconnectTimer.Stop()
+			gs.disconnectTimer = nil
+		}
 	}
 	gs.mu.Unlock()
 
 	if shouldStart {
-		go playNextSong(s, guildID, textChannelID)
+		go playNextSong(s, guildID, textChannelID, generation)
 	}
 	return nil
 }
@@ -637,7 +807,7 @@ func enqueueTrack(s *discordgo.Session, guildID, textChannelID, voiceChannelID s
 
 // playNextSong is the main playback loop for a guild.  It runs as a goroutine
 // and processes the queue until it is empty, then returns.
-func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
+func playNextSong(s *discordgo.Session, guildID, textChannelID string, generation uint64) {
 	gs := getGuildState(guildID)
 
 	dl, err := ytDownloaderPath()
@@ -645,35 +815,99 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 		log.Printf("downloader: %v", err)
 		_, _ = s.ChannelMessageSend(textChannelID, "yt-dlp must be installed and on PATH.")
 		gs.mu.Lock()
-		gs.isPlaying = false
+		if gs.playbackGeneration.Load() == generation {
+			gs.isPlaying = false
+		}
 		gs.mu.Unlock()
 		return
 	}
 
 	for {
+		if gs.playbackGeneration.Load() != generation {
+			return
+		}
+
 		gs.mu.Lock()
-		if len(gs.songQueue) == 0 {
-			gs.isPlaying = false
-			if gs.disconnectTimer != nil {
-				gs.disconnectTimer.Stop()
-				gs.disconnectTimer = nil
-			}
+		if gs.playbackGeneration.Load() != generation {
 			gs.mu.Unlock()
 			return
 		}
+		if len(gs.songQueue) == 0 {
+			seed := gs.lastPlayed
+			voiceChannelID := gs.lastVoiceChannelID
+			canAutoplay := gs.autoplayEnabled && trackVideoID(seed) != "" && voiceChannelID != ""
+			if !canAutoplay {
+				gs.isPlaying = false
+				gs.mu.Unlock()
+				return
+			}
+			excluded := gs.autoplayExclusionsLocked()
+			gs.mu.Unlock()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			nextTrack, err := resolveAutoplayTrack(ctx, seed, excluded)
+			cancel()
+			if err != nil {
+				log.Printf("autoplay: %v", err)
+				if gs.playbackGeneration.Load() != generation {
+					return
+				}
+				_, _ = s.ChannelMessageSend(textChannelID, "Autoplay could not find another related track.")
+				gs.mu.Lock()
+				if gs.playbackGeneration.Load() == generation {
+					gs.isPlaying = false
+				}
+				gs.mu.Unlock()
+				return
+			}
+
+			gs.mu.Lock()
+			if gs.playbackGeneration.Load() != generation {
+				gs.mu.Unlock()
+				return
+			}
+			if len(gs.songQueue) > 0 {
+				gs.mu.Unlock()
+				continue
+			}
+			if !gs.autoplayEnabled {
+				gs.isPlaying = false
+				gs.mu.Unlock()
+				return
+			}
+			gs.songQueue = append(gs.songQueue, Song{
+				guildID:   guildID,
+				channelID: voiceChannelID,
+				track:     nextTrack,
+			})
+			gs.mu.Unlock()
+			continue
+		}
 		song := gs.songQueue[0]
 		gs.songQueue = gs.songQueue[1:]
+		gs.lastPlayed = song.track
+		gs.lastVoiceChannelID = song.channelID
+		gs.rememberTrackLocked(song.track)
+		if gs.disconnectTimer != nil {
+			gs.disconnectTimer.Stop()
+			gs.disconnectTimer = nil
+		}
 		gs.mu.Unlock()
 
 		gs.skipInterrupt.Store(false)
 
 		vc, err := s.ChannelVoiceJoin(song.guildID, song.channelID, false, true)
 		if err != nil {
+			if gs.playbackGeneration.Load() != generation {
+				return
+			}
 			log.Printf("voice join: %v", err)
 			// Put the song back and stop — a transient failure shouldn't silently drop it.
 			gs.mu.Lock()
-			gs.songQueue = append([]Song{song}, gs.songQueue...)
-			gs.isPlaying = false
+			if gs.playbackGeneration.Load() == generation {
+				gs.songQueue = append([]Song{song}, gs.songQueue...)
+				gs.isPlaying = false
+			}
 			gs.mu.Unlock()
 			_, _ = s.ChannelMessageSend(textChannelID, fmt.Sprintf("Could not join voice: %v", err))
 			return
@@ -682,6 +916,9 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 		sendNowPlayingEmbed(s, textChannelID, song.track)
 
 		if err := streamAudio(gs, vc, dl, song.track.URL); err != nil {
+			if gs.playbackGeneration.Load() != generation {
+				return
+			}
 			if gs.skipInterrupt.Load() {
 				gs.skipInterrupt.Store(false)
 				_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
@@ -690,21 +927,28 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 				_, _ = s.ChannelMessageSend(textChannelID, "Playback error; skipping to next track.")
 			}
 		} else if gs.skipInterrupt.Load() {
+			if gs.playbackGeneration.Load() != generation {
+				return
+			}
 			gs.skipInterrupt.Store(false)
 			_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
 		}
 
 		// Reset the idle-disconnect timer after each track finishes.
-		if gs.disconnectTimer != nil {
-			gs.disconnectTimer.Stop()
-		}
 		vconn := vc
-		gs.disconnectTimer = time.AfterFunc(15*time.Minute, func() {
-			gs.intentionalLeave.Store(true)
-			if err := vconn.Disconnect(); err != nil {
-				log.Printf("idle disconnect: %v", err)
+		gs.mu.Lock()
+		if gs.playbackGeneration.Load() == generation {
+			if gs.disconnectTimer != nil {
+				gs.disconnectTimer.Stop()
 			}
-		})
+			gs.disconnectTimer = time.AfterFunc(15*time.Minute, func() {
+				gs.intentionalLeave.Store(true)
+				if err := vconn.Disconnect(); err != nil {
+					log.Printf("idle disconnect: %v", err)
+				}
+			})
+		}
+		gs.mu.Unlock()
 	}
 }
 
@@ -1026,8 +1270,36 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			}
 			gs.mu.Unlock()
 			_ = respondEphemeral(s, i, "Queue shuffled.")
+		case "autoplay":
+			handleSlashAutoplay(s, i, gs)
 		}
 	}
+}
+
+func handleSlashAutoplay(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	hasRequestedState := false
+	requestedState := false
+	for _, opt := range i.ApplicationCommandData().Options {
+		if opt.Name == "enabled" {
+			hasRequestedState = true
+			requestedState = opt.BoolValue()
+			break
+		}
+	}
+
+	gs.mu.Lock()
+	enabled := !gs.autoplayEnabled
+	if hasRequestedState {
+		enabled = requestedState
+	}
+	gs.autoplayEnabled = enabled
+	gs.mu.Unlock()
+
+	if enabled {
+		_ = respondEphemeral(s, i, "Autoplay enabled. When the queue ends, I will add a related track.")
+		return
+	}
+	_ = respondEphemeral(s, i, "Autoplay disabled.")
 }
 
 // handleSlashPlay handles the /play command: verifies the user is in a voice
