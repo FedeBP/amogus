@@ -1,5 +1,19 @@
 package main
 
+// Discord music bot – streams audio from YouTube via yt-dlp + ffmpeg.
+//
+// Audio pipeline (zero PCM conversion):
+//
+//	yt-dlp stdout ──pipe──▶ ffmpeg (-c:a libopus, OGG muxer) stdout
+//	                                       │
+//	                              oggDemux (this file)
+//	                                       │
+//	                              raw Opus packets ──▶ vc.OpusSend
+//
+// Removing the PCM → gopus encode step cuts CPU usage significantly because
+// ffmpeg's native libopus encoder runs in a single optimised C call rather
+// than bouncing through a Go ↔ Cgo ↔ libopus round-trip per 20 ms frame.
+
 import (
 	"context"
 	"encoding/binary"
@@ -21,11 +35,10 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"google.golang.org/api/option"
 	"google.golang.org/api/youtube/v3"
-	"layeh.com/gopus"
 )
 
 // ---------------------------------------------------------------------------
-// Config
+// Configuration
 // ---------------------------------------------------------------------------
 
 type configStruct struct {
@@ -34,39 +47,27 @@ type configStruct struct {
 	APIKey    string `json:"APIKey"`
 }
 
-type cachedSearch struct {
-	results []SearchResult
-	expires time.Time
-}
-
 var (
 	Token     string
 	BotPrefix string
 	APIKey    string
 	config    *configStruct
 	BotID     string
-	searchCache = map[string]cachedSearch{}
-	searchCacheMu sync.Mutex
 )
 
-var searchHTTP = &http.Client{
-    Timeout: 2 * time.Second,
-    Transport: &http.Transport{
-        MaxIdleConns:        100,
-        MaxIdleConnsPerHost: 100,
-        IdleConnTimeout:     90 * time.Second,
-    },
-}
-
+// GetConfig loads configuration from config.json and then overrides any
+// fields with environment variables when present.
+// Order of precedence: env var > config.json > built-in default.
 func GetConfig() {
 	log.Printf("Reading configuration...")
+
 	var fileCfg configStruct
 	if data, err := os.ReadFile("./config.json"); err == nil {
 		if err := json.Unmarshal(data, &fileCfg); err != nil {
-			log.Fatalf("config.json: %v", err)
+			log.Fatalf("config.json parse error: %v", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		log.Fatalf("config.json: %v", err)
+		log.Fatalf("config.json read error: %v", err)
 	}
 
 	Token     = strings.TrimSpace(fileCfg.Token)
@@ -82,23 +83,26 @@ func GetConfig() {
 	if v := strings.TrimSpace(os.Getenv("BOT_PREFIX")); v != "" {
 		BotPrefix = v
 	}
+
 	if BotPrefix == "" {
 		BotPrefix = "&"
 	}
 	if Token == "" {
-		log.Fatal("Missing Discord token: set DISCORD_BOT_TOKEN or token in config.json")
+		log.Fatal("Missing Discord token: set DISCORD_BOT_TOKEN or 'token' in config.json")
 	}
 	if APIKey == "" {
-		log.Fatal("Missing YouTube API key: set YOUTUBE_API_KEY or APIKey in config.json")
+		log.Fatal("Missing YouTube API key: set YOUTUBE_API_KEY or 'APIKey' in config.json")
 	}
+
 	config = &configStruct{Token: Token, BotPrefix: BotPrefix, APIKey: APIKey}
 	log.Printf("Configuration loaded.")
 }
 
 // ---------------------------------------------------------------------------
-// Per-guild state
+// Domain types
 // ---------------------------------------------------------------------------
 
+// Track is metadata for a single playable item.
 type Track struct {
 	URL      string
 	Title    string
@@ -106,32 +110,43 @@ type Track struct {
 	Duration string
 }
 
+// Song pairs a Track with the Discord IDs needed to play it.
 type Song struct {
-	guildID    string
-	channelID  string
-	track Track
+	guildID   string
+	channelID string
+	track     Track
 }
 
+// SearchResult is the JSON shape returned by the Python search sidecar.
 type SearchResult struct {
-    Title    string `json:"title"`
-    Artist   string `json:"artist"`
-    VideoID  string `json:"videoId"`
-    Duration string `json:"duration"`
+	Title    string `json:"title"`
+	Artist   string `json:"artist"`
+	VideoID  string `json:"videoId"`
+	Duration string `json:"duration"`
 }
+
+// ---------------------------------------------------------------------------
+// Per-guild playback state
+// ---------------------------------------------------------------------------
 
 // guildState holds all mutable playback state for one Discord server.
-// Keeping this per-guild means multiple servers never interfere with each other.
+// Keeping state per-guild ensures that multiple servers never interfere.
 type guildState struct {
-	mu               sync.Mutex
-	songQueue        []Song
-	isPlaying        bool
-	disconnectTimer  *time.Timer
-	activeDlCmd      *exec.Cmd
-	activeFfCmd      *exec.Cmd
+	mu              sync.Mutex
+	songQueue       []Song
+	isPlaying       bool
+	disconnectTimer *time.Timer
+	activeDlCmd     *exec.Cmd
+	activeFfCmd     *exec.Cmd
+	// skipInterrupt is set to true by skip/stop to signal streamAudio to halt.
 	skipInterrupt    atomic.Bool
+	// intentionalLeave prevents botVoiceStateHandler from treating a
+	// programmatic disconnect as an external kick.
 	intentionalLeave atomic.Bool
 }
 
+// killPlaybackProcesses kills the active yt-dlp and ffmpeg processes, if any.
+// The caller must NOT hold gs.mu when calling this — it acquires the lock itself.
 func (gs *guildState) killPlaybackProcesses() {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
@@ -145,11 +160,15 @@ func (gs *guildState) killPlaybackProcesses() {
 	gs.activeFfCmd = nil
 }
 
+// interruptPlayback signals the streaming loop to stop the current track
+// and kills the underlying processes immediately.
 func (gs *guildState) interruptPlayback() {
 	gs.skipInterrupt.Store(true)
 	gs.killPlaybackProcesses()
 }
 
+// resetPlaybackState clears the queue, kills active processes, and cancels
+// any pending idle-disconnect timer. Used by &stop and external kicks.
 func (gs *guildState) resetPlaybackState() {
 	gs.killPlaybackProcesses()
 	gs.skipInterrupt.Store(false)
@@ -163,11 +182,13 @@ func (gs *guildState) resetPlaybackState() {
 	gs.mu.Unlock()
 }
 
+// Guild-state registry.
 var (
 	guildsMu sync.Mutex
 	guilds   = make(map[string]*guildState)
 )
 
+// getGuildState returns the guildState for guildID, creating one if absent.
 func getGuildState(guildID string) *guildState {
 	guildsMu.Lock()
 	defer guildsMu.Unlock()
@@ -180,7 +201,7 @@ func getGuildState(guildID string) *guildState {
 }
 
 // ---------------------------------------------------------------------------
-// Globals
+// Global helpers
 // ---------------------------------------------------------------------------
 
 var (
@@ -194,14 +215,33 @@ var (
 const (
 	maxPlaylistTracks    = 200
 	discordChoiceNameMax = 100
-	// Discord requires 48 kHz stereo Opus; 960 samples = 20 ms per frame.
-	opusFrameSize    = 960
-	opusChannels     = 2
-	opusMaxFrameSize = 5760
 )
 
+// searchCache caches YTMusic search results for 10 minutes to avoid
+// redundant HTTP round-trips to the Python sidecar during autocomplete.
+var (
+	searchCacheMu sync.Mutex
+	searchCache   = map[string]cachedSearch{}
+)
+
+type cachedSearch struct {
+	results []SearchResult
+	expires time.Time
+}
+
+// searchHTTP is a shared HTTP client for the Python search sidecar.
+// Using a single client reuses TCP connections across requests.
+var searchHTTP = &http.Client{
+	Timeout: 2 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // ---------------------------------------------------------------------------
-// Bot setup
+// Slash command definitions
 // ---------------------------------------------------------------------------
 
 var slashCommands = []*discordgo.ApplicationCommand{
@@ -218,21 +258,27 @@ var slashCommands = []*discordgo.ApplicationCommand{
 			},
 		},
 	},
-	{Name: "skip", Description: "Skip the current track"},
-	{Name: "stop", Description: "Stop playback and clear the queue"},
+	{Name: "skip",    Description: "Skip the current track"},
+	{Name: "stop",    Description: "Stop playback and clear the queue"},
 	{Name: "shuffle", Description: "Shuffle the queue"},
 }
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
 
 func main() {
 	GetConfig()
 	Start()
-	<-make(chan struct{})
+	<-make(chan struct{}) // block forever; bot runs on goroutines/handlers
 }
 
+// Start initialises the Discord session, registers event handlers,
+// and opens the WebSocket gateway connection.
 func Start() {
 	session, err := discordgo.New("Bot " + Token)
 	if err != nil {
-		log.Fatalf("Couldn't initialize bot: %v", err)
+		log.Fatalf("Couldn't initialise bot: %v", err)
 	}
 
 	user, err := session.User("@me")
@@ -249,6 +295,8 @@ func Start() {
 	session.AddHandler(botVoiceStateHandler)
 	session.AddHandler(interactionHandler)
 	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+		// Overwrite all slash commands on startup so any definition changes
+		// take effect without manual intervention.
 		appID := r.User.ID
 		if r.Application != nil && r.Application.ID != "" {
 			appID = r.Application.ID
@@ -263,13 +311,15 @@ func Start() {
 	if err = session.Open(); err != nil {
 		log.Fatalf("Error opening session: %v", err)
 	}
-	log.Printf("Bot initialized successfully. 👾")
+	log.Printf("Bot initialised successfully. 👾")
 }
 
 // ---------------------------------------------------------------------------
 // Voice helpers
 // ---------------------------------------------------------------------------
 
+// voiceChannelForUser returns the voice channel ID that userID is currently
+// in within guildID, or errNotInVoice if they are not in any channel.
 func voiceChannelForUser(s *discordgo.Session, guildID, userID string) (string, error) {
 	g, err := s.State.Guild(guildID)
 	if err != nil {
@@ -284,20 +334,24 @@ func voiceChannelForUser(s *discordgo.Session, guildID, userID string) (string, 
 }
 
 // botVoiceStateHandler detects when the bot is removed from a voice channel
-// by someone else and clears the queue for that guild.
+// by an external actor and clears the guild queue accordingly.
+// It ignores disconnects that the bot itself initiates (intentionalLeave flag).
 func botVoiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
 	if vs == nil || vs.VoiceState == nil || vs.UserID != BotID || BotID == "" {
 		return
 	}
 	if vs.ChannelID != "" {
-		return // bot joined or moved, not a leave
+		return // bot joined or moved — not a leave event
 	}
+
 	gs := getGuildState(vs.GuildID)
 	if gs.intentionalLeave.CompareAndSwap(true, false) {
-		return // we triggered this disconnect ourselves
+		return // we triggered this disconnect ourselves; ignore it
 	}
+
 	log.Printf("Bot was removed from voice in guild %s; clearing queue.", vs.GuildID)
 	gs.resetPlaybackState()
+
 	s.RLock()
 	vc, ok := s.VoiceConnections[vs.GuildID]
 	s.RUnlock()
@@ -308,9 +362,12 @@ func botVoiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) 
 }
 
 // ---------------------------------------------------------------------------
-// URL / search helpers
+// URL helpers
 // ---------------------------------------------------------------------------
 
+// extractYouTubeVideoID parses a YouTube URL and returns the video ID,
+// or an empty string if the input is not a recognised YouTube URL.
+// Handles youtube.com/watch, youtu.be short links, and /shorts/ URLs.
 func extractYouTubeVideoID(s string) string {
 	u, err := url.Parse(strings.TrimSpace(s))
 	if err != nil {
@@ -339,6 +396,8 @@ func extractYouTubeVideoID(s string) string {
 	return ""
 }
 
+// ytDownloaderPath returns the absolute path of yt-dlp (preferred) or
+// youtube-dl, whichever is found first on PATH.
 func ytDownloaderPath() (string, error) {
 	for _, name := range []string{"yt-dlp", "youtube-dl"} {
 		if path, err := exec.LookPath(name); err == nil {
@@ -348,55 +407,55 @@ func ytDownloaderPath() (string, error) {
 	return "", errors.New("yt-dlp not found in PATH")
 }
 
+// ---------------------------------------------------------------------------
+// Search / track resolution
+// ---------------------------------------------------------------------------
+
+// resolveTrack turns a raw query string into a playable Track.
+//
+//   - If query is a YouTube URL, the video ID is extracted directly.
+//   - Otherwise the Python YTMusic sidecar is queried and the first
+//     suitable result is returned.
 func resolveTrack(ctx context.Context, query string) (Track, error) {
 	query = strings.TrimSpace(query)
-
 	if query == "" {
 		return Track{}, errors.New("empty query")
 	}
 
-	// Direct URL handling
 	if id := extractYouTubeVideoID(query); id != "" {
-		return Track{
-			URL: "https://www.youtube.com/watch?v=" + id,
-		}, nil
+		return Track{URL: "https://www.youtube.com/watch?v=" + id}, nil
 	}
 
 	results, err := ytMusicSearch(ctx, query)
 	if err != nil {
 		return Track{}, err
 	}
-
 	if len(results) == 0 {
 		return Track{}, errors.New("no suitable results found")
 	}
 
-	first := results[0]
-
+	r := results[0]
 	return Track{
-		URL:      "https://www.youtube.com/watch?v=" + first.VideoID,
-		Title:    first.Title,
-		Artist:   first.Artist,
-		Duration: first.Duration,
+		URL:      "https://www.youtube.com/watch?v=" + r.VideoID,
+		Title:    r.Title,
+		Artist:   r.Artist,
+		Duration: r.Duration,
 	}, nil
 }
 
-// ytMusicSearch uses a Python script to search YouTube Music and return a list of search results.
+// ytMusicSearch queries the Python search sidecar for up to 5 song results.
+// Results are cached for 10 minutes, so rapid autocomplete keystrokes do not
+// hammer the sidecar with duplicate requests.
 func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 	searchCacheMu.Lock()
-
-	if cached, ok := searchCache[query]; ok {
-		if time.Now().Before(cached.expires) {
-			searchCacheMu.Unlock()
-			return cached.results, nil
-		}
+	if cached, ok := searchCache[query]; ok && time.Now().Before(cached.expires) {
+		searchCacheMu.Unlock()
+		return cached.results, nil
 	}
-	
 	searchCacheMu.Unlock()
 
-	url := "http://127.0.0.1:5000/search?q=" + url.QueryEscape(query)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	reqURL := "http://127.0.0.1:5000/search?q=" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +467,6 @@ func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 	defer resp.Body.Close()
 
 	var results []SearchResult
-
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		return nil, err
 	}
@@ -423,75 +481,41 @@ func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 	return results, nil
 }
 
-// ytMusicFirstResult uses a Python script to search YouTube Music and return the first search result.
-func ytMusicFirstResult(ctx context.Context, query string) (string, error) {
-	url := "http://127.0.0.1:5000/first?q=" + url.QueryEscape(query)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return "", err
+// youtubeAutocompleteChoices returns Discord autocomplete choices for the
+// given partial query string. Returns an empty slice (never nil) on error
+// so Discord always receives a valid (possibly empty) autocomplete response.
+func youtubeAutocompleteChoices(ctx context.Context, query string) ([]*discordgo.ApplicationCommandOptionChoice, error) {
+	query = strings.TrimSpace(query)
+	if len([]rune(query)) < 2 {
+		return []*discordgo.ApplicationCommandOptionChoice{}, nil
 	}
 
-	resp, err := searchHTTP.Do(req)
+	results, err := ytMusicSearch(ctx, query)
 	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	out, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return strings.TrimSpace(string(out)), nil
+	choices := make([]*discordgo.ApplicationCommandOptionChoice, 0, len(results))
+	for _, r := range results {
+		if r.VideoID == "" {
+			continue
+		}
+		label := r.Title
+		if r.Artist != "" {
+			label += " · " + r.Artist
+		}
+		if r.Duration != "" {
+			label += " [" + r.Duration + "]"
+		}
+		choices = append(choices, &discordgo.ApplicationCommandOptionChoice{
+			Name:  truncateChoiceLabel(label, discordChoiceNameMax),
+			Value: "https://www.youtube.com/watch?v=" + r.VideoID,
+		})
+	}
+	return choices, nil
 }
 
-// youtubeAutocompleteChoices uses a Python script to search YouTube Music and return a list of autocomplete choices.
-func youtubeAutocompleteChoices(
-    ctx context.Context,
-    query string,
-) ([]*discordgo.ApplicationCommandOptionChoice, error) {
-
-    query = strings.TrimSpace(query)
-
-    if len([]rune(query)) < 2 {
-        return []*discordgo.ApplicationCommandOptionChoice{}, nil
-    }
-
-    results, err := ytMusicSearch(ctx, query)
-    if err != nil {
-        return nil, err
-    }
-
-    choices := make([]*discordgo.ApplicationCommandOptionChoice, 0)
-
-    for _, r := range results {
-        if r.VideoID == "" {
-            continue
-        }
-
-        label := r.Title
-
-        if r.Artist != "" {
-            label += " · " + r.Artist
-        }
-
-        if r.Duration != "" {
-            label += " [" + r.Duration + "]"
-        }
-
-        choices = append(
-            choices,
-            &discordgo.ApplicationCommandOptionChoice{
-                Name: truncateChoiceLabel(label, discordChoiceNameMax),
-                Value: "https://www.youtube.com/watch?v=" + r.VideoID,
-            },
-        )
-    }
-
-    return choices, nil
-}
-
+// truncateChoiceLabel shortens s to at most max runes, appending "…" if cut.
 func truncateChoiceLabel(s string, max int) string {
 	runes := []rune(strings.TrimSpace(s))
 	if len(runes) <= max {
@@ -500,28 +524,33 @@ func truncateChoiceLabel(s string, max int) string {
 	return string(runes[:max-1]) + "…"
 }
 
-// fetchPlaylistEnqueue resolves a YouTube playlist and enqueues each video.
-// It pages through results so playback can start before the full list is fetched.
+// ---------------------------------------------------------------------------
+// Playlist support
+// ---------------------------------------------------------------------------
+
+// fetchPlaylistEnqueue resolves a YouTube playlist URL and enqueues each
+// video using the YouTube Data API v3.  It pages through results in batches
+// of 50, capped at maxPlaylistTracks, so playback can start before the full
+// list has been fetched.
 func fetchPlaylistEnqueue(ctx context.Context, s *discordgo.Session, guildID, textChannelID, voiceChannelID, playlistURL string) (int, error) {
 	u, err := url.Parse(strings.TrimSpace(playlistURL))
 	if err != nil {
 		return 0, fmt.Errorf("invalid URL: %w", err)
 	}
-	q, err := url.ParseQuery(u.RawQuery)
-	if err != nil {
-		return 0, err
-	}
-	playlistID := strings.TrimSpace(q.Get("list"))
+	playlistID := strings.TrimSpace(u.Query().Get("list"))
 	if playlistID == "" {
-		return 0, errors.New("no list= in URL — paste the full playlist URL from YouTube")
+		return 0, errors.New("no list= parameter in URL — paste the full playlist URL")
 	}
-	service, err := youtube.NewService(ctx, option.WithAPIKey(APIKey))
+
+	svc, err := youtube.NewService(ctx, option.WithAPIKey(APIKey))
 	if err != nil {
 		return 0, fmt.Errorf("youtube client: %w", err)
 	}
+
 	total := 0
-	call := service.PlaylistItems.List([]string{"contentDetails"}).
+	call := svc.PlaylistItems.List([]string{"contentDetails"}).
 		PlaylistId(playlistID).MaxResults(50).Context(ctx)
+
 	err = call.Pages(ctx, func(page *youtube.PlaylistItemListResponse) error {
 		for _, item := range page.Items {
 			if item.ContentDetails == nil || item.ContentDetails.VideoId == "" {
@@ -530,19 +559,13 @@ func fetchPlaylistEnqueue(ctx context.Context, s *discordgo.Session, guildID, te
 			if total >= maxPlaylistTracks {
 				return errPlaylistMaxSize
 			}
-			_ = enqueueTrack(
-				s,
-				guildID,
-				textChannelID,
-				voiceChannelID,
-				Track{
-					URL: "https://www.youtube.com/watch?v=" + item.ContentDetails.VideoId,
-				},
-			)
+			_ = enqueueTrack(s, guildID, textChannelID, voiceChannelID,
+				Track{URL: "https://www.youtube.com/watch?v=" + item.ContentDetails.VideoId})
 			total++
 		}
 		return nil
 	})
+
 	if errors.Is(err, errPlaylistMaxSize) {
 		return total, errPlaylistMaxSize
 	}
@@ -553,80 +576,67 @@ func fetchPlaylistEnqueue(ctx context.Context, s *discordgo.Session, guildID, te
 // Play flow
 // ---------------------------------------------------------------------------
 
+// runPlayFlow is the top-level handler for a /play command.
+// It decides whether the query is a playlist or a single track, then
+// delegates to the appropriate enqueue function.  Returns a human-readable
+// status string suitable for sending back to the user (may be empty for the
+// single-track happy path, where the Now Playing embed speaks for itself).
 func runPlayFlow(ctx context.Context, s *discordgo.Session, guildID, textChannelID, voiceChannelID, query string) string {
 	if strings.Contains(query, "list=") {
 		_, _ = s.ChannelMessageSend(textChannelID, "Resolving playlist…")
 		n, err := fetchPlaylistEnqueue(ctx, s, guildID, textChannelID, voiceChannelID, query)
-		if err != nil {
-			if errors.Is(err, errPlaylistMaxSize) {
-				return fmt.Sprintf("Queued %d tracks (limit is %d per playlist).", n, maxPlaylistTracks)
-			}
-			if n > 0 {
-				return fmt.Sprintf("Loaded %d tracks, then hit an error: %v", n, err)
-			}
+		switch {
+		case errors.Is(err, errPlaylistMaxSize):
+			return fmt.Sprintf("Queued %d tracks (limit is %d per playlist).", n, maxPlaylistTracks)
+		case err != nil && n > 0:
+			return fmt.Sprintf("Loaded %d tracks, then hit an error: %v", n, err)
+		case err != nil:
 			log.Printf("playlist: %v", err)
 			return fmt.Sprintf("Could not load playlist: %v", err)
-		}
-		if n == 0 {
+		case n == 0:
 			return "That playlist has no playable videos."
+		default:
+			return fmt.Sprintf("Queued %d tracks.", n)
 		}
-		return fmt.Sprintf("Queued %d tracks.", n)
 	}
 
 	track, err := resolveTrack(ctx, query)
 	if err != nil {
 		return fmt.Sprintf("Could not find a track: %v", err)
 	}
-	_ = enqueueTrack(
-		s,
-		guildID,
-		textChannelID,
-		voiceChannelID,
-		track,
-	)
-	
+	_ = enqueueTrack(s, guildID, textChannelID, voiceChannelID, track)
 	return ""
 }
 
-func enqueueTrack(
-	s *discordgo.Session,
-	guildID,
-	textChannelID,
-	voiceChannelID string,
-	track Track,
-) error {
-
+// enqueueTrack appends a track to the guild queue and starts the playback
+// goroutine if nothing is currently playing.
+func enqueueTrack(s *discordgo.Session, guildID, textChannelID, voiceChannelID string, track Track) error {
 	gs := getGuildState(guildID)
 
 	gs.mu.Lock()
-
 	gs.songQueue = append(gs.songQueue, Song{
 		guildID:   guildID,
 		channelID: voiceChannelID,
 		track:     track,
 	})
-
 	shouldStart := !gs.isPlaying
-
 	if shouldStart {
 		gs.isPlaying = true
 	}
-
 	gs.mu.Unlock()
 
 	if shouldStart {
 		go playNextSong(s, guildID, textChannelID)
 	}
-
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// Playback
+// Playback loop
 // ---------------------------------------------------------------------------
 
-// playNextSong is the main playback loop for a guild. It runs in its own
-// goroutine and processes the queue until empty.
+// playNextSong is the main playback loop for a guild.  It runs as a goroutine
+// and processes the queue until it is empty, then returns.
 func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 	gs := getGuildState(guildID)
 
@@ -634,17 +644,6 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 	if err != nil {
 		log.Printf("downloader: %v", err)
 		_, _ = s.ChannelMessageSend(textChannelID, "yt-dlp must be installed and on PATH.")
-		gs.mu.Lock()
-		gs.isPlaying = false
-		gs.mu.Unlock()
-		return
-	}
-
-	// Create the Opus encoder once for this playback session and reuse it
-	// across all songs — avoids repeated allocation and encoder state setup.
-	opusEncoder, err := gopus.NewEncoder(48000, opusChannels, gopus.Audio)
-	if err != nil {
-		log.Printf("create opus encoder: %v", err)
 		gs.mu.Lock()
 		gs.isPlaying = false
 		gs.mu.Unlock()
@@ -671,6 +670,7 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 		vc, err := s.ChannelVoiceJoin(song.guildID, song.channelID, false, true)
 		if err != nil {
 			log.Printf("voice join: %v", err)
+			// Put the song back and stop — a transient failure shouldn't silently drop it.
 			gs.mu.Lock()
 			gs.songQueue = append([]Song{song}, gs.songQueue...)
 			gs.isPlaying = false
@@ -679,35 +679,9 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 			return
 		}
 
-		description := song.track.URL
+		sendNowPlayingEmbed(s, textChannelID, song.track)
 
-		if song.track.Title != "" {
-			description = fmt.Sprintf(
-				"**%s**",
-				song.track.Title,
-			)
-
-			if song.track.Artist != "" {
-				description += "\n" + song.track.Artist
-			}
-
-			if song.track.Duration != "" {
-				description += "\nDuration: " + song.track.Duration
-			}
-		}
-
-		embed := &discordgo.MessageEmbed{
-			Title:       "🎵 Now Playing",
-			Description: description,
-			URL:         song.track.URL,
-		}
-
-		_, _ = s.ChannelMessageSendEmbed(
-			textChannelID,
-			embed,
-		)
-
-		if err := streamAudio(gs, vc, dl, song.track.URL, opusEncoder); err != nil {
+		if err := streamAudio(gs, vc, dl, song.track.URL); err != nil {
 			if gs.skipInterrupt.Load() {
 				gs.skipInterrupt.Store(false)
 				_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
@@ -720,7 +694,7 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 			_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
 		}
 
-		// Reset the idle-disconnect timer after each track.
+		// Reset the idle-disconnect timer after each track finishes.
 		if gs.disconnectTimer != nil {
 			gs.disconnectTimer.Stop()
 		}
@@ -734,17 +708,128 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string) {
 	}
 }
 
-// streamAudio pipes yt-dlp directly into ffmpeg and sends the resulting Opus
-// frames to Discord. No temp file is written — audio starts playing as soon
-// as the first frames arrive, cutting the old 10-15 s wait to ~1-2 s.
+// sendNowPlayingEmbed posts a "Now Playing" embed to the text channel.
+// If the track has no metadata (direct URL, no search), only the URL is shown.
+func sendNowPlayingEmbed(s *discordgo.Session, textChannelID string, t Track) {
+	description := t.URL
+	if t.Title != "" {
+		description = "**" + t.Title + "**"
+		if t.Artist != "" {
+			description += "\n" + t.Artist
+		}
+		if t.Duration != "" {
+			description += "\nDuration: " + t.Duration
+		}
+	}
+	_, _ = s.ChannelMessageSendEmbed(textChannelID, &discordgo.MessageEmbed{
+		Title:       "🎵 Now Playing",
+		Description: description,
+		URL:         t.URL,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// OGG/Opus demuxer
+// ---------------------------------------------------------------------------
 //
-//	yt-dlp stdout ──pipe──▶ ffmpeg stdin → ffmpeg stdout ──▶ opusEncoder ──▶ Discord
+// ffmpeg writes an OGG container when told to encode with libopus.  OGG pages
+// have a fixed 27-byte header plus a variable-length segment table.  The first
+// two pages are the Opus identification and comment headers; every subsequent
+// page carries audio packets that can be forwarded verbatim to Discord.
 //
-// The Opus encoder is passed in and reused across songs.
-// PCM and byte buffers are pre-allocated once and reused every frame,
-// eliminating the two make() calls per frame that existed in the original code.
-func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string, opusEncoder *gopus.Encoder) error {
-	// yt-dlp: select best audio format, write raw stream to stdout.
+// OGG page layout (https://www.rfc-editor.org/rfc/rfc3533):
+//
+//	Bytes  0– 3  capture pattern "OggS"
+//	Byte   4     version (always 0)
+//	Byte   5     header type flags
+//	Bytes  6–13  granule position (uint64 LE)
+//	Bytes 14–17  bitstream serial number (uint32 LE)
+//	Bytes 18–21  page sequence number (uint32 LE)
+//	Bytes 22–25  CRC checksum (uint32 LE)
+//	Byte  26     number of segments (N)
+//	Bytes 27–26+N  segment table (N bytes, each = segment length, 255 = continuation)
+//	Remaining   page body (sum of segment lengths)
+
+const oggCapturePattern = "OggS"
+
+// oggPage is one decoded OGG page.
+type oggPage struct {
+	sequenceNum uint32
+	granulePos  uint64
+	headerType  byte
+	packets     [][]byte // reassembled lacing packets on this page
+}
+
+// readOggPage reads and parses the next OGG page from r.
+func readOggPage(r io.Reader) (*oggPage, error) {
+	// Fixed 27-byte header.
+	var header [27]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	if string(header[0:4]) != oggCapturePattern {
+		return nil, fmt.Errorf("ogg: bad capture pattern %q", header[0:4])
+	}
+
+	page := &oggPage{
+		headerType:  header[5],
+		granulePos:  binary.LittleEndian.Uint64(header[6:14]),
+		sequenceNum: binary.LittleEndian.Uint32(header[18:22]),
+	}
+
+	nSegs := int(header[26])
+	segTable := make([]byte, nSegs)
+	if _, err := io.ReadFull(r, segTable); err != nil {
+		return nil, fmt.Errorf("ogg: reading segment table: %w", err)
+	}
+
+	// Read the page body as one contiguous slice, then split into packets
+	// using the lacing values.  A segment of 255 bytes means the packet
+	// continues in the next segment; anything shorter terminates it.
+	bodyLen := 0
+	for _, s := range segTable {
+		bodyLen += int(s)
+	}
+	body := make([]byte, bodyLen)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return nil, fmt.Errorf("ogg: reading page body: %w", err)
+	}
+
+	offset := 0
+	var pkt []byte
+	for _, s := range segTable {
+		pkt = append(pkt, body[offset:offset+int(s)]...)
+		offset += int(s)
+		if s < 255 { // last segment of this packet
+			page.packets = append(page.packets, pkt)
+			pkt = nil
+		}
+	}
+	if len(pkt) > 0 {
+		// Continued packet with no terminator on this page (rare).
+		page.packets = append(page.packets, pkt)
+	}
+
+	return page, nil
+}
+
+// ---------------------------------------------------------------------------
+// Audio streaming
+// ---------------------------------------------------------------------------
+
+// streamAudio pipes yt-dlp into ffmpeg (native Opus encoding) and forwards
+// raw Opus packets directly to Discord — no PCM conversion or Go-side encoding.
+//
+// Pipeline:
+//
+//	yt-dlp -f bestaudio -o - <url>
+//	      └─pipe─▶ ffmpeg -i pipe:0 -c:a libopus -ar 48000 -ac 2
+//	                       -b:a 128k -vbr on -f ogg pipe:1
+//	                              └─oggDemux─▶ vc.OpusSend
+//
+// The two Opus header pages (identification + comment) are skipped;
+// every audio packet thereafter is sent as-is.
+func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string) error {
 	dlCmd := exec.Command(dl,
 		"--no-playlist",
 		"-f", "bestaudio",
@@ -752,17 +837,18 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		youtubeURL,
 	)
 
-	// ffmpeg: read from stdin, output raw signed 16-bit little-endian PCM.
 	ffCmd := exec.Command("ffmpeg",
 		"-i", "pipe:0",
-		"-f", "s16le",
+		"-c:a", "libopus",
 		"-ar", "48000",
 		"-ac", "2",
+		"-b:a", "128k",
+		"-vbr", "on",
+		"-f", "ogg",
 		"pipe:1",
 	)
-	ffCmd.Stderr = io.Discard // suppress ffmpeg's verbose stderr
+	ffCmd.Stderr = io.Discard
 
-	// Wire yt-dlp stdout → ffmpeg stdin.
 	dlStdout, err := dlCmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("yt-dlp stdout pipe: %w", err)
@@ -782,7 +868,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		return fmt.Errorf("ffmpeg start: %w", err)
 	}
 
-	// Register processes so skip/stop can kill them immediately.
+	// Register active processes so skip/stop can kill them immediately.
 	gs.mu.Lock()
 	gs.activeDlCmd = dlCmd
 	gs.activeFfCmd = ffCmd
@@ -799,19 +885,27 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		gs.mu.Unlock()
 	}()
 
-	// Pre-allocate buffers once; reuse every frame.
-	rawBuf := make([]byte, opusFrameSize*opusChannels*2) // 16-bit = 2 bytes/sample
-	pcmBuf := make([]int16, opusFrameSize*opusChannels)
+	// Skip the two mandatory Opus header pages (identification + comment).
+	// pageIndex 0 = OpusHead, pageIndex 1 = OpusTags.
+	for skip := 0; skip < 2; skip++ {
+		if _, err := readOggPage(ffStdout); err != nil {
+			if gs.skipInterrupt.Load() {
+				break
+			}
+			return fmt.Errorf("ogg header page %d: %w", skip, err)
+		}
+	}
 
+	// Stream audio pages until EOF or skip signal.
 	for {
 		if gs.skipInterrupt.Load() {
 			break
 		}
 
-		_, err := io.ReadFull(ffStdout, rawBuf)
+		page, err := readOggPage(ffStdout)
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break // end of stream — normal exit
+				break // normal end of stream
 			}
 			if gs.skipInterrupt.Load() {
 				break
@@ -819,29 +913,19 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 			_ = dlCmd.Process.Kill()
 			_ = ffCmd.Process.Kill()
 			_, _ = dlCmd.Wait(), ffCmd.Wait()
-			return fmt.Errorf("read pcm: %w", err)
+			return fmt.Errorf("ogg demux: %w", err)
 		}
 
-		// Decode little-endian bytes → int16 PCM in-place.
-		for i := range pcmBuf {
-			pcmBuf[i] = int16(binary.LittleEndian.Uint16(rawBuf[i*2 : i*2+2]))
-		}
-
-		opusData, err := opusEncoder.Encode(pcmBuf, opusFrameSize, opusMaxFrameSize)
-		if err != nil {
+		for _, pkt := range page.packets {
 			if gs.skipInterrupt.Load() {
 				break
 			}
-			_ = dlCmd.Process.Kill()
-			_ = ffCmd.Process.Kill()
-			_, _ = dlCmd.Wait(), ffCmd.Wait()
-			return fmt.Errorf("opus encode: %w", err)
+			if len(pkt) > 0 {
+				vc.OpusSend <- pkt
+			}
 		}
-
-		vc.OpusSend <- opusData
 	}
 
-	// Wait for both processes to exit (or after kill on skip/stop).
 	_ = dlCmd.Wait()
 	if err := ffCmd.Wait(); err != nil && !gs.skipInterrupt.Load() {
 		return fmt.Errorf("ffmpeg exit: %w", err)
@@ -850,9 +934,11 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 }
 
 // ---------------------------------------------------------------------------
-// Interaction (slash command) handler
+// Interaction handler
 // ---------------------------------------------------------------------------
 
+// interactionUserID returns the Discord user ID from an interaction,
+// handling both guild (Member) and DM (User) contexts.
 func interactionUserID(i *discordgo.InteractionCreate) string {
 	if i.Member != nil && i.Member.User != nil {
 		return i.Member.User.ID
@@ -863,6 +949,8 @@ func interactionUserID(i *discordgo.InteractionCreate) string {
 	return ""
 }
 
+// respondEphemeral sends an ephemeral (user-only visible) text response
+// to a slash command interaction.
 func respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) error {
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -873,12 +961,13 @@ func respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, cont
 	})
 }
 
+// interactionHandler dispatches both autocomplete and slash command events.
 func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	switch i.Type {
 
 	case discordgo.InteractionApplicationCommandAutocomplete:
 		data := i.ApplicationCommandData()
-		if data.Name != "play" || APIKey == "" {
+		if data.Name != "play" {
 			return
 		}
 		var query string
@@ -930,7 +1019,9 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			n := len(gs.songQueue)
 			if n > 1 {
 				rngMu.Lock()
-				rng.Shuffle(n, func(i, j int) { gs.songQueue[i], gs.songQueue[j] = gs.songQueue[j], gs.songQueue[i] })
+				rng.Shuffle(n, func(i, j int) {
+					gs.songQueue[i], gs.songQueue[j] = gs.songQueue[j], gs.songQueue[i]
+				})
 				rngMu.Unlock()
 			}
 			gs.mu.Unlock()
@@ -939,12 +1030,16 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	}
 }
 
+// handleSlashPlay handles the /play command: verifies the user is in a voice
+// channel, defers the response immediately (to avoid Discord's 3-second
+// timeout), then resolves and enqueues the track in a goroutine.
 func handleSlashPlay(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	uid := interactionUserID(i)
 	if uid == "" {
 		_ = respondEphemeral(s, i, "Could not identify your user.")
 		return
 	}
+
 	voiceChID, err := voiceChannelForUser(s, i.GuildID, uid)
 	if err != nil {
 		msg := "Join a voice channel first, then run `/play`."
@@ -967,7 +1062,7 @@ func handleSlashPlay(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	// Defer immediately so Discord doesn't time out while we search/resolve.
+	// Defer immediately so Discord does not time out during search/resolve.
 	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	}); err != nil {
