@@ -1310,6 +1310,52 @@ func (gs *guildState) snapshotQueue() queueSnapshot {
 	return snapshot
 }
 
+func (gs *guildState) removeQueuedTrack(index int) (Track, int, bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	total := len(gs.songQueue)
+	if index < 1 || index > total {
+		return Track{}, total, false
+	}
+	removed := gs.songQueue[index-1].track
+	gs.songQueue = append(gs.songQueue[:index-1], gs.songQueue[index:]...)
+	return removed, total, true
+}
+
+func (gs *guildState) moveQueuedTrack(from, to int) (Track, int, bool) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	total := len(gs.songQueue)
+	if from < 1 || from > total || to < 1 || to > total {
+		return Track{}, total, false
+	}
+	if from == to {
+		return gs.songQueue[from-1].track, total, true
+	}
+	song := gs.songQueue[from-1]
+	without := make([]Song, 0, total-1)
+	without = append(without, gs.songQueue[:from-1]...)
+	without = append(without, gs.songQueue[from:]...)
+	insertAt := to - 1
+	reordered := make([]Song, 0, total)
+	reordered = append(reordered, without[:insertAt]...)
+	reordered = append(reordered, song)
+	reordered = append(reordered, without[insertAt:]...)
+	gs.songQueue = reordered
+	return song.track, total, true
+}
+
+func (gs *guildState) clearQueuedTracks() int {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	n := len(gs.songQueue)
+	gs.songQueue = nil
+	return n
+}
+
 func buildQueueEmbed(gs *guildState, page int) *discordgo.MessageEmbed {
 	snapshot := gs.snapshotQueue()
 	if page < 1 {
@@ -1417,6 +1463,13 @@ func truncateRunes(s string, max int) string {
 		return string(runes[:max])
 	}
 	return string(runes[:max-3]) + "..."
+}
+
+func pluralize(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,6 +1845,12 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			}
 			gs.mu.Unlock()
 			_ = respondEphemeral(s, i, "Queue shuffled.")
+		case "remove":
+			handleSlashRemove(s, i, gs)
+		case "move":
+			handleSlashMove(s, i, gs)
+		case "clear":
+			handleSlashClear(s, i, gs)
 		case "queue":
 			handleSlashQueue(s, i, gs)
 		case "autoplay":
@@ -1819,6 +1878,53 @@ func handleSlashSkip(s *discordgo.Session, i *discordgo.InteractionCreate, gs *g
 		}
 		_ = enqueueTrack(s, i.GuildID, i.ChannelID, req.voiceChannelID, nextTrack)
 	}()
+}
+
+func handleSlashRemove(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	index := 0
+	for _, opt := range i.ApplicationCommandData().Options {
+		if opt.Name == "index" {
+			index = int(opt.IntValue())
+			break
+		}
+	}
+	removed, total, ok := gs.removeQueuedTrack(index)
+	if !ok {
+		_ = respondEphemeral(s, i, fmt.Sprintf("There is no queued track #%d. Queue size: %d.", index, total))
+		return
+	}
+	_ = respondEphemeral(s, i, fmt.Sprintf("Removed #%d: %s", index, formatQueueTrack(removed)))
+}
+
+func handleSlashMove(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	from, to := 0, 0
+	for _, opt := range i.ApplicationCommandData().Options {
+		switch opt.Name {
+		case "from":
+			from = int(opt.IntValue())
+		case "to":
+			to = int(opt.IntValue())
+		}
+	}
+	moved, total, ok := gs.moveQueuedTrack(from, to)
+	if !ok {
+		_ = respondEphemeral(s, i, fmt.Sprintf("Could not move #%d to #%d. Queue size: %d.", from, to, total))
+		return
+	}
+	if from == to {
+		_ = respondEphemeral(s, i, fmt.Sprintf("#%d is already there: %s", from, formatQueueTrack(moved)))
+		return
+	}
+	_ = respondEphemeral(s, i, fmt.Sprintf("Moved #%d to #%d: %s", from, to, formatQueueTrack(moved)))
+}
+
+func handleSlashClear(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	n := gs.clearQueuedTracks()
+	if n == 0 {
+		_ = respondEphemeral(s, i, "Queue is already empty.")
+		return
+	}
+	_ = respondEphemeral(s, i, fmt.Sprintf("Cleared %d queued %s.", n, pluralize(n, "track", "tracks")))
 }
 
 func handleSlashQueue(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {

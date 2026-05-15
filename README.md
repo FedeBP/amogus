@@ -132,6 +132,9 @@ Join a voice channel, then use the commands in a text channel where the bot can 
 | `/skip` | Skip the current track and continue with the queue. |
 | `/stop` | Stop playback, clear the queue, and disconnect from voice. |
 | `/shuffle` | Shuffle the queued tracks. |
+| `/remove index:<number>` | Remove an upcoming track by queue number. |
+| `/move from:<number> to:<number>` | Move an upcoming track to a new queue position. |
+| `/clear` | Clear upcoming tracks without stopping the current song. |
 | `/queue [page]` | Show the current track, upcoming tracks, queue count, and autoplay status. |
 | `/autoplay [enabled]` | Toggle autoplay, or set it explicitly with `enabled:true` / `enabled:false`. When enabled, the bot adds a related YouTube Music radio suggestion after the queue runs out. |
 

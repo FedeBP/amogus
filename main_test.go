@@ -331,3 +331,114 @@ func TestBuildQueueEmbedPaginatesQueue(t *testing.T) {
 		t.Fatalf("up next field = %q, did not want first page track", embed.Fields[1].Value)
 	}
 }
+
+func TestRemoveQueuedTrack(t *testing.T) {
+	gs := &guildState{songQueue: []Song{
+		{track: Track{Title: "One"}},
+		{track: Track{Title: "Two"}},
+		{track: Track{Title: "Three"}},
+	}}
+
+	removed, total, ok := gs.removeQueuedTrack(2)
+
+	if !ok {
+		t.Fatal("removeQueuedTrack() ok = false, want true")
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+	if removed.Title != "Two" {
+		t.Fatalf("removed title = %q, want Two", removed.Title)
+	}
+	if got := queueTitles(gs.songQueue); got != "One,Three" {
+		t.Fatalf("queue = %q, want One,Three", got)
+	}
+}
+
+func TestRemoveQueuedTrackRejectsInvalidIndex(t *testing.T) {
+	gs := &guildState{songQueue: []Song{{track: Track{Title: "One"}}}}
+
+	_, total, ok := gs.removeQueuedTrack(2)
+
+	if ok {
+		t.Fatal("removeQueuedTrack() ok = true, want false")
+	}
+	if total != 1 {
+		t.Fatalf("total = %d, want 1", total)
+	}
+	if got := queueTitles(gs.songQueue); got != "One" {
+		t.Fatalf("queue = %q, want One", got)
+	}
+}
+
+func TestMoveQueuedTrack(t *testing.T) {
+	gs := &guildState{songQueue: []Song{
+		{track: Track{Title: "One"}},
+		{track: Track{Title: "Two"}},
+		{track: Track{Title: "Three"}},
+	}}
+
+	moved, total, ok := gs.moveQueuedTrack(3, 1)
+
+	if !ok {
+		t.Fatal("moveQueuedTrack() ok = false, want true")
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+	if moved.Title != "Three" {
+		t.Fatalf("moved title = %q, want Three", moved.Title)
+	}
+	if got := queueTitles(gs.songQueue); got != "Three,One,Two" {
+		t.Fatalf("queue = %q, want Three,One,Two", got)
+	}
+}
+
+func TestMoveQueuedTrackRejectsInvalidIndex(t *testing.T) {
+	gs := &guildState{songQueue: []Song{
+		{track: Track{Title: "One"}},
+		{track: Track{Title: "Two"}},
+	}}
+
+	_, total, ok := gs.moveQueuedTrack(1, 3)
+
+	if ok {
+		t.Fatal("moveQueuedTrack() ok = true, want false")
+	}
+	if total != 2 {
+		t.Fatalf("total = %d, want 2", total)
+	}
+	if got := queueTitles(gs.songQueue); got != "One,Two" {
+		t.Fatalf("queue = %q, want One,Two", got)
+	}
+}
+
+func TestClearQueuedTracks(t *testing.T) {
+	gs := &guildState{
+		isPlaying: true,
+		songQueue: []Song{
+			{track: Track{Title: "One"}},
+			{track: Track{Title: "Two"}},
+		},
+	}
+
+	n := gs.clearQueuedTracks()
+
+	if n != 2 {
+		t.Fatalf("cleared count = %d, want 2", n)
+	}
+	if len(gs.songQueue) != 0 {
+		t.Fatalf("queue length = %d, want 0", len(gs.songQueue))
+	}
+	if !gs.isPlaying {
+		t.Fatal("isPlaying = false, want true")
+	}
+}
+
+func queueTitles(queue []Song) string {
+	titles := make([]string, 0, len(queue))
+	for _, song := range queue {
+		titles = append(titles, song.track.Title)
+	}
+	return strings.Join(titles, ",")
+}
