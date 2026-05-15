@@ -27,11 +27,11 @@ RUN apt-get update \
 		ffmpeg \
 		python3 \
 		python3-venv \
-		yt-dlp \
 	&& python3 -m venv /opt/search-venv \
 	&& /opt/search-venv/bin/pip install --no-cache-dir \
 		flask \
 		waitress \
+		yt-dlp \
 		ytmusicapi \
 	&& rm -rf /var/lib/apt/lists/*
 

@@ -15,6 +15,7 @@ package main
 // than bouncing through a Go ↔ Cgo ↔ libopus round-trip per 20 ms frame.
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -31,6 +32,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"google.golang.org/api/option"
@@ -139,6 +141,7 @@ type guildState struct {
 	lastPlayed         Track
 	lastVoiceChannelID string
 	recentVideoIDs     []string
+	recentTracks       []Track
 	disconnectTimer    *time.Timer
 	activeDlCmd        *exec.Cmd
 	activeFfCmd        *exec.Cmd
@@ -172,6 +175,32 @@ func (gs *guildState) interruptPlayback() {
 	gs.killPlaybackProcesses()
 }
 
+func disconnectVoiceConnection(vc *discordgo.VoiceConnection) error {
+	if vc == nil {
+		return nil
+	}
+	// discordgo may attempt to reconnect a VoiceConnection using its last
+	// ChannelID after transport errors. Clear it before closing local voice
+	// resources so an external kick or stop cannot auto-rejoin later.
+	vc.Lock()
+	vc.ChannelID = ""
+	vc.Unlock()
+	return vc.Disconnect()
+}
+
+func (gs *guildState) stopAfterAutoplayError(generation uint64) bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if gs.playbackGeneration.Load() != generation {
+		return true
+	}
+	if len(gs.songQueue) > 0 {
+		return false
+	}
+	gs.isPlaying = false
+	return true
+}
+
 // resetPlaybackState clears the queue, kills active processes, and cancels
 // any pending idle-disconnect timer. Used by /stop and external kicks.
 func (gs *guildState) resetPlaybackState() {
@@ -181,9 +210,11 @@ func (gs *guildState) resetPlaybackState() {
 	gs.mu.Lock()
 	gs.songQueue = nil
 	gs.isPlaying = false
+	gs.autoplayEnabled = false
 	gs.lastPlayed = Track{}
 	gs.lastVoiceChannelID = ""
 	gs.recentVideoIDs = nil
+	gs.recentTracks = nil
 	if gs.disconnectTimer != nil {
 		gs.disconnectTimer.Stop()
 		gs.disconnectTimer = nil
@@ -226,6 +257,9 @@ const (
 	discordChoiceNameMax   = 100
 	autoplayCandidateLimit = 25
 	recentVideoMemory      = 50
+	recentTrackMemory      = 20
+	opusSendTimeout        = 2 * time.Second
+	opusSendPollInterval   = 20 * time.Millisecond
 )
 
 // searchCache caches YTMusic search results for 10 minutes to avoid
@@ -372,19 +406,22 @@ func botVoiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) 
 	}
 
 	gs := getGuildState(vs.GuildID)
-	if gs.intentionalLeave.CompareAndSwap(true, false) {
-		return // we triggered this disconnect ourselves; ignore it
+	wasIntentional := gs.intentionalLeave.CompareAndSwap(true, false)
+	if wasIntentional {
+		log.Printf("Bot left voice in guild %s; clearing playback state.", vs.GuildID)
+	} else {
+		log.Printf("Bot was removed from voice in guild %s; clearing playback state.", vs.GuildID)
 	}
 
-	log.Printf("Bot was removed from voice in guild %s; clearing queue.", vs.GuildID)
 	gs.resetPlaybackState()
 
 	s.RLock()
 	vc, ok := s.VoiceConnections[vs.GuildID]
 	s.RUnlock()
 	if ok && vc != nil {
-		gs.intentionalLeave.Store(true)
-		_ = vc.Disconnect()
+		if err := disconnectVoiceConnection(vc); err != nil {
+			log.Printf("voice cleanup after disconnect: %v", err)
+		}
 	}
 }
 
@@ -436,19 +473,41 @@ func trackFromSearchResult(r SearchResult) Track {
 	}
 }
 
-// rememberTrackLocked records recently played video IDs so autoplay does not
+func trackHasAutoplayIdentity(t Track) bool {
+	return trackVideoID(t) != "" || normalizedAutoplayTitle(t.Title) != "" || normalizedAutoplayArtist(t.Artist) != ""
+}
+
+func sameAutoplayIdentity(a, b Track) bool {
+	aID, bID := trackVideoID(a), trackVideoID(b)
+	if aID != "" && bID != "" {
+		return aID == bID
+	}
+	aTitle, bTitle := normalizedAutoplayTitle(a.Title), normalizedAutoplayTitle(b.Title)
+	aArtist, bArtist := normalizedAutoplayArtist(a.Artist), normalizedAutoplayArtist(b.Artist)
+	return aTitle != "" && aTitle == bTitle && aArtist != "" && aArtist == bArtist
+}
+
+// rememberTrackLocked records recently played tracks so autoplay does not
 // immediately loop the same few recommendations. The caller must hold gs.mu.
 func (gs *guildState) rememberTrackLocked(t Track) {
 	id := trackVideoID(t)
-	if id == "" {
+	if id != "" {
+		if len(gs.recentVideoIDs) == 0 || gs.recentVideoIDs[len(gs.recentVideoIDs)-1] != id {
+			gs.recentVideoIDs = append(gs.recentVideoIDs, id)
+			if len(gs.recentVideoIDs) > recentVideoMemory {
+				gs.recentVideoIDs = gs.recentVideoIDs[len(gs.recentVideoIDs)-recentVideoMemory:]
+			}
+		}
+	}
+	if !trackHasAutoplayIdentity(t) {
 		return
 	}
-	if len(gs.recentVideoIDs) > 0 && gs.recentVideoIDs[len(gs.recentVideoIDs)-1] == id {
+	if len(gs.recentTracks) > 0 && sameAutoplayIdentity(gs.recentTracks[len(gs.recentTracks)-1], t) {
 		return
 	}
-	gs.recentVideoIDs = append(gs.recentVideoIDs, id)
-	if len(gs.recentVideoIDs) > recentVideoMemory {
-		gs.recentVideoIDs = gs.recentVideoIDs[len(gs.recentVideoIDs)-recentVideoMemory:]
+	gs.recentTracks = append(gs.recentTracks, t)
+	if len(gs.recentTracks) > recentTrackMemory {
+		gs.recentTracks = gs.recentTracks[len(gs.recentTracks)-recentTrackMemory:]
 	}
 }
 
@@ -470,6 +529,147 @@ func (gs *guildState) autoplayExclusionsLocked() map[string]struct{} {
 		}
 	}
 	return excluded
+}
+
+func (gs *guildState) autoplayHistoryLocked() []Track {
+	history := make([]Track, 0, len(gs.recentTracks)+len(gs.songQueue)+1)
+	history = append(history, gs.recentTracks...)
+	if trackHasAutoplayIdentity(gs.lastPlayed) {
+		history = append(history, gs.lastPlayed)
+	}
+	for _, song := range gs.songQueue {
+		if trackHasAutoplayIdentity(song.track) {
+			history = append(history, song.track)
+		}
+	}
+	return history
+}
+
+func normalizedAutoplayArtist(s string) string {
+	return strings.Join(autoplayTextTokens(s, false), " ")
+}
+
+func normalizedAutoplayTitle(s string) string {
+	return strings.Join(autoplayTextTokens(s, true), " ")
+}
+
+func autoplayTextTokens(s string, dropNoise bool) []string {
+	s = strings.ToLower(stripBracketedText(s))
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte(' ')
+	}
+	raw := strings.Fields(b.String())
+	tokens := make([]string, 0, len(raw))
+	for _, token := range raw {
+		if dropNoise && isAutoplayTitleNoise(token) {
+			continue
+		}
+		tokens = append(tokens, token)
+	}
+	return tokens
+}
+
+func stripBracketedText(s string) string {
+	var b strings.Builder
+	depth := 0
+	for _, r := range s {
+		switch r {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+func isAutoplayTitleNoise(token string) bool {
+	switch token {
+	case "official", "audio", "video", "music", "lyrics", "lyric", "visualizer",
+		"remaster", "remastered", "live", "explicit", "clean", "hd", "hq",
+		"feat", "ft", "featuring", "version", "edit", "single", "album":
+		return true
+	default:
+		return false
+	}
+}
+
+func autoplayTitleSimilar(a, b string) bool {
+	aTokens := strings.Fields(normalizedAutoplayTitle(a))
+	bTokens := strings.Fields(normalizedAutoplayTitle(b))
+	if len(aTokens) == 0 || len(bTokens) == 0 {
+		return false
+	}
+	common := 0
+	seen := make(map[string]struct{}, len(aTokens))
+	for _, token := range aTokens {
+		seen[token] = struct{}{}
+	}
+	for _, token := range bTokens {
+		if _, ok := seen[token]; ok {
+			common++
+		}
+	}
+	minLen, maxLen := len(aTokens), len(bTokens)
+	if minLen > maxLen {
+		minLen, maxLen = maxLen, minLen
+	}
+	if common == minLen && minLen >= 2 {
+		return true
+	}
+	return common >= 2 && float64(common)/float64(maxLen) >= 0.67
+}
+
+func autoplayNearDuplicate(candidate Track, history []Track) bool {
+	candidateArtist := normalizedAutoplayArtist(candidate.Artist)
+	for _, previous := range history {
+		if sameAutoplayIdentity(candidate, previous) {
+			return true
+		}
+		previousArtist := normalizedAutoplayArtist(previous.Artist)
+		sameKnownArtist := candidateArtist != "" && candidateArtist == previousArtist
+		if sameKnownArtist && autoplayTitleSimilar(candidate.Title, previous.Title) {
+			return true
+		}
+		if candidateArtist == "" && previousArtist == "" && autoplayTitleSimilar(candidate.Title, previous.Title) {
+			return true
+		}
+	}
+	return false
+}
+
+func autoplayCandidateScore(candidate Track, history []Track, position int) int {
+	score := 1000 - position
+	candidateArtist := normalizedAutoplayArtist(candidate.Artist)
+	for i := len(history) - 1; i >= 0; i-- {
+		previous := history[i]
+		recencyPenalty := len(history) - i
+		previousArtist := normalizedAutoplayArtist(previous.Artist)
+		if candidateArtist != "" && candidateArtist == previousArtist {
+			score -= 15
+			if recencyPenalty <= 3 {
+				score -= 25
+			}
+		}
+		if autoplayTitleSimilar(candidate.Title, previous.Title) {
+			score -= 50
+			if recencyPenalty <= 5 {
+				score -= 80
+			}
+		}
+	}
+	return score
 }
 
 // ytDownloaderPath returns the absolute path of yt-dlp (preferred) or
@@ -624,7 +824,7 @@ func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResul
 	return results, nil
 }
 
-func resolveAutoplayTrack(ctx context.Context, seed Track, excluded map[string]struct{}) (Track, error) {
+func resolveAutoplayTrack(ctx context.Context, seed Track, excluded map[string]struct{}, history []Track) (Track, error) {
 	seedID := trackVideoID(seed)
 	if seedID == "" {
 		return Track{}, errors.New("last track has no YouTube video ID")
@@ -634,16 +834,29 @@ func resolveAutoplayTrack(ctx context.Context, seed Track, excluded map[string]s
 	if err != nil {
 		return Track{}, err
 	}
-	for _, r := range results {
+	var best Track
+	bestScore := -1 << 30
+	for i, r := range results {
 		if r.VideoID == "" {
 			continue
 		}
 		if _, seen := excluded[r.VideoID]; seen {
 			continue
 		}
-		return trackFromSearchResult(r), nil
+		track := trackFromSearchResult(r)
+		if autoplayNearDuplicate(track, history) {
+			continue
+		}
+		score := autoplayCandidateScore(track, history, i)
+		if score > bestScore {
+			best = track
+			bestScore = score
+		}
 	}
-	return Track{}, errors.New("no unused radio suggestions found")
+	if best.URL != "" {
+		return best, nil
+	}
+	return Track{}, errors.New("no fresh radio suggestions found")
 }
 
 // youtubeAutocompleteChoices returns Discord autocomplete choices for the
@@ -842,10 +1055,11 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 				return
 			}
 			excluded := gs.autoplayExclusionsLocked()
+			history := gs.autoplayHistoryLocked()
 			gs.mu.Unlock()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			nextTrack, err := resolveAutoplayTrack(ctx, seed, excluded)
+			nextTrack, err := resolveAutoplayTrack(ctx, seed, excluded, history)
 			cancel()
 			if err != nil {
 				log.Printf("autoplay: %v", err)
@@ -853,12 +1067,10 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 					return
 				}
 				_, _ = s.ChannelMessageSend(textChannelID, "Autoplay could not find another related track.")
-				gs.mu.Lock()
-				if gs.playbackGeneration.Load() == generation {
-					gs.isPlaying = false
+				if gs.stopAfterAutoplayError(generation) {
+					return
 				}
-				gs.mu.Unlock()
-				return
+				continue
 			}
 
 			gs.mu.Lock()
@@ -942,8 +1154,9 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 				gs.disconnectTimer.Stop()
 			}
 			gs.disconnectTimer = time.AfterFunc(15*time.Minute, func() {
+				gs.resetPlaybackState()
 				gs.intentionalLeave.Store(true)
-				if err := vconn.Disconnect(); err != nil {
+				if err := disconnectVoiceConnection(vconn); err != nil {
 					log.Printf("idle disconnect: %v", err)
 				}
 			})
@@ -1061,6 +1274,54 @@ func readOggPage(r io.Reader) (*oggPage, error) {
 // Audio streaming
 // ---------------------------------------------------------------------------
 
+func processOutputTail(name string, stderr *bytes.Buffer) string {
+	output := strings.TrimSpace(stderr.String())
+	if output == "" {
+		return ""
+	}
+	const maxOutputLen = 2000
+	if len(output) > maxOutputLen {
+		output = output[len(output)-maxOutputLen:]
+	}
+	return name + " stderr: " + output
+}
+
+func streamProcessError(reason string, err error, dlStderr, ffStderr *bytes.Buffer) error {
+	details := make([]string, 0, 2)
+	if output := processOutputTail("yt-dlp", dlStderr); output != "" {
+		details = append(details, output)
+	}
+	if output := processOutputTail("ffmpeg", ffStderr); output != "" {
+		details = append(details, output)
+	}
+	if len(details) == 0 {
+		return fmt.Errorf("%s: %w", reason, err)
+	}
+	return fmt.Errorf("%s: %w; %s", reason, err, strings.Join(details, " | "))
+}
+
+func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte) error {
+	if vc == nil || vc.OpusSend == nil {
+		return errors.New("voice connection is not ready to send audio")
+	}
+	timeout := time.NewTimer(opusSendTimeout)
+	defer timeout.Stop()
+	ticker := time.NewTicker(opusSendPollInterval)
+	defer ticker.Stop()
+	for {
+		if gs.skipInterrupt.Load() {
+			return nil
+		}
+		select {
+		case vc.OpusSend <- pkt:
+			return nil
+		case <-timeout.C:
+			return errors.New("timed out sending audio packet to voice connection")
+		case <-ticker.C:
+		}
+	}
+}
+
 // streamAudio pipes yt-dlp into ffmpeg (native Opus encoding) and forwards
 // raw Opus packets directly to Discord — no PCM conversion or Go-side encoding.
 //
@@ -1074,12 +1335,15 @@ func readOggPage(r io.Reader) (*oggPage, error) {
 // The two Opus header pages (identification + comment) are skipped;
 // every audio packet thereafter is sent as-is.
 func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string) error {
+	var dlStderr, ffStderr bytes.Buffer
+
 	dlCmd := exec.Command(dl,
 		"--no-playlist",
 		"-f", "bestaudio",
 		"-o", "-",
 		youtubeURL,
 	)
+	dlCmd.Stderr = &dlStderr
 
 	ffCmd := exec.Command("ffmpeg",
 		"-i", "pipe:0",
@@ -1091,7 +1355,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		"-f", "ogg",
 		"pipe:1",
 	)
-	ffCmd.Stderr = io.Discard
+	ffCmd.Stderr = &ffStderr
 
 	dlStdout, err := dlCmd.StdoutPipe()
 	if err != nil {
@@ -1105,11 +1369,11 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 	}
 
 	if err := dlCmd.Start(); err != nil {
-		return fmt.Errorf("yt-dlp start: %w", err)
+		return streamProcessError("yt-dlp start", err, &dlStderr, &ffStderr)
 	}
 	if err := ffCmd.Start(); err != nil {
 		_ = dlCmd.Process.Kill()
-		return fmt.Errorf("ffmpeg start: %w", err)
+		return streamProcessError("ffmpeg start", err, &dlStderr, &ffStderr)
 	}
 
 	// Register active processes so skip/stop can kill them immediately.
@@ -1132,11 +1396,17 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 	// Skip the two mandatory Opus header pages (identification + comment).
 	// pageIndex 0 = OpusHead, pageIndex 1 = OpusTags.
 	for skip := 0; skip < 2; skip++ {
+		if gs.skipInterrupt.Load() {
+			break
+		}
 		if _, err := readOggPage(ffStdout); err != nil {
 			if gs.skipInterrupt.Load() {
 				break
 			}
-			return fmt.Errorf("ogg header page %d: %w", skip, err)
+			_ = dlCmd.Process.Kill()
+			_ = ffCmd.Process.Kill()
+			_, _ = dlCmd.Wait(), ffCmd.Wait()
+			return streamProcessError(fmt.Sprintf("ogg header page %d", skip), err, &dlStderr, &ffStderr)
 		}
 	}
 
@@ -1157,7 +1427,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 			_ = dlCmd.Process.Kill()
 			_ = ffCmd.Process.Kill()
 			_, _ = dlCmd.Wait(), ffCmd.Wait()
-			return fmt.Errorf("ogg demux: %w", err)
+			return streamProcessError("ogg demux", err, &dlStderr, &ffStderr)
 		}
 
 		for _, pkt := range page.packets {
@@ -1165,14 +1435,31 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 				break
 			}
 			if len(pkt) > 0 {
-				vc.OpusSend <- pkt
+				if err := sendOpusPacket(gs, vc, pkt); err != nil {
+					_ = dlCmd.Process.Kill()
+					_ = ffCmd.Process.Kill()
+					_, _ = dlCmd.Wait(), ffCmd.Wait()
+					return err
+				}
 			}
 		}
 	}
 
-	_ = dlCmd.Wait()
-	if err := ffCmd.Wait(); err != nil && !gs.skipInterrupt.Load() {
-		return fmt.Errorf("ffmpeg exit: %w", err)
+	if gs.skipInterrupt.Load() {
+		_ = dlCmd.Process.Kill()
+		_ = ffCmd.Process.Kill()
+	}
+
+	dlErr := dlCmd.Wait()
+	ffErr := ffCmd.Wait()
+	if gs.skipInterrupt.Load() {
+		return nil
+	}
+	if dlErr != nil {
+		return streamProcessError("yt-dlp exit", dlErr, &dlStderr, &ffStderr)
+	}
+	if ffErr != nil {
+		return streamProcessError("ffmpeg exit", ffErr, &dlStderr, &ffStderr)
 	}
 	return nil
 }
@@ -1255,7 +1542,9 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			s.RUnlock()
 			if ok && vc != nil {
 				gs.intentionalLeave.Store(true)
-				_ = vc.Disconnect()
+				if err := disconnectVoiceConnection(vc); err != nil {
+					log.Printf("stop disconnect: %v", err)
+				}
 			}
 			_ = respondEphemeral(s, i, "Stopped and cleared the queue.")
 		case "shuffle":

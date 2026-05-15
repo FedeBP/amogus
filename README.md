@@ -137,7 +137,7 @@ Join a voice channel, then use the commands in a text channel where the bot can 
 ## Behavior Notes
 
 - Playback is streamed through pipes; the bot should not create `audio.mp3*` temporary files.
-- `/autoplay` is per server and stays enabled until disabled or the process restarts.
+- `/autoplay` is per server for the current voice session and resets when playback is stopped or the bot disconnects.
 - Autoplay skips recently played video IDs to avoid immediately looping the same suggestions.
 - `/stop` clears playback state and prevents autoplay from requeueing after a manual stop.
 - If the bot is kicked from voice, the queue is cleared and it will not auto-rejoin.
