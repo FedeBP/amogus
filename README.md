@@ -1,18 +1,54 @@
 # amogus
 
-A Discord music bot written in Go. It plays YouTube / YouTube Music audio in voice channels through slash commands, with search and autocomplete powered by a small Python YTMusic sidecar.
+A private Discord music bot for playing YouTube and YouTube Music audio in voice channels through slash commands.
 
-The audio path streams directly:
+The bot is built for small-server use: join voice, queue music from chat, keep the queue tidy, and optionally let autoplay continue the session with related tracks.
 
-```text
-yt-dlp stdout -> ffmpeg libopus OGG stdout -> OGG demux -> Discord OpusSend
-```
+## How To Use
 
-There is no Go-side PCM decode/encode step anymore, and the project no longer depends on `layeh.com/gopus`.
+1. Join a voice channel.
+2. Use `/play query:<song, artist, YouTube URL, or playlist URL>` in a text channel where the bot can respond.
+3. Manage playback and the queue with slash commands.
 
-Respect copyright, YouTube's Terms of Service, and your local laws. This project is for personal/educational use.
+The bot searches YouTube Music for normal text queries. It also accepts direct YouTube video URLs and playlist URLs containing `list=`.
 
-## Requirements
+## Commands
+
+| Command | What it does |
+|---------|--------------|
+| `/play query:<query or URL>` | Plays or queues a song, YouTube URL, or playlist URL. Playlists load up to 200 tracks. |
+| `/queue [page]` | Shows the current song, upcoming tracks, queue count, and autoplay status. |
+| `/skip` | Skips the current song. If autoplay is on and the queue is empty, the bot looks for another related track. |
+| `/stop` | Stops playback, clears the queue, resets autoplay, and disconnects from voice. |
+| `/shuffle` | Shuffles upcoming tracks. |
+| `/remove index:<number>` | Removes an upcoming track by queue number. Use `/queue` to see numbers. |
+| `/move from:<number> to:<number>` | Moves an upcoming track to another queue position. |
+| `/clear` | Clears upcoming tracks without stopping the current song. |
+| `/autoplay [enabled]` | Toggles autoplay, or sets it with `enabled:true` / `enabled:false`. |
+
+## Autoplay
+
+Autoplay is per server and lasts only for the current voice session. It resets when the bot is stopped, disconnected, or kicked from voice.
+
+When autoplay is enabled and the queue runs out, the bot asks the YouTube Music sidecar for related tracks. It keeps recent track history so it can avoid exact repeats and near-duplicate title/artist loops.
+
+## Queue Tips
+
+- `/queue` is the best way to check what the bot thinks is happening.
+- Queue numbers only apply to upcoming tracks. The current song is shown separately.
+- `/clear` does not stop the current song.
+- `/stop` is the hard reset: current song, queue, voice connection, and autoplay all end.
+
+## Behavior Notes
+
+- The bot should not auto-rejoin when someone disconnects it from voice.
+- If the bot is kicked from voice, playback state and autoplay are cleared.
+- After playback ends, the bot disconnects after 15 minutes of inactivity.
+- Search, autocomplete, and autoplay suggestions require the local Python sidecar.
+
+## Operator Setup
+
+### Requirements
 
 | Requirement | Notes |
 |-------------|-------|
@@ -24,9 +60,9 @@ Respect copyright, YouTube's Terms of Service, and your local laws. This project
 | Discord bot token | From the Discord Developer Portal. |
 | YouTube Data API v3 key | Used for playlist expansion. Search/radio uses the YTMusic sidecar. |
 
-CGO, a C compiler, and `gopus` are not required for the current audio pipeline.
+CGO, a C compiler, and `gopus` are not required by the current audio pipeline.
 
-## Configuration
+### Configuration
 
 Create `config.json` next to the executable, or run from the repo root:
 
@@ -38,23 +74,17 @@ Create `config.json` next to the executable, or run from the repo root:
 }
 ```
 
-| Field | Required | Meaning |
-|-------|----------|---------|
-| `token` | Yes | Discord bot token. |
-| `APIKey` | Yes | YouTube Data API v3 key for playlist expansion. |
-| `botPrefix` | No | Legacy field; commands are slash commands now. |
-
 Environment variables override `config.json`:
 
-| Variable | Overrides |
-|----------|-----------|
+| Variable | Meaning |
+|----------|---------|
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `YOUTUBE_API_KEY` | YouTube Data API v3 key |
 | `BOT_PREFIX` | Legacy prefix field |
 
 Keep secrets out of Git. `config.json` is ignored by this repo.
 
-## Discord Setup
+### Discord Setup
 
 Invite the bot with these OAuth scopes:
 
@@ -69,7 +99,7 @@ The bot uses guild and voice-state gateway intents. Message Content Intent is no
 
 Some Discord voice regions require E2EE/DAVE. This repo still uses a `replace` in `go.mod` to build `discordgo` from a fork with DAVE support. When upstream ships that support, the replace can be removed.
 
-## Local Run
+### Local Run
 
 Install the Python sidecar dependencies once:
 
@@ -77,28 +107,28 @@ Install the Python sidecar dependencies once:
 python -m pip install flask waitress ytmusicapi
 ```
 
-Run the sidecar in one terminal:
+Run a clean local session:
 
 ```powershell
-python search.py
-```
-
-Run the bot in another terminal:
-
-```powershell
-go run .
+Start-Process powershell -ArgumentList "-NoExit", "-Command", "python search.py"
+go clean -cache
+go clean -testcache
+$env:CGO_ENABLED="1"
+$env:CGO_CFLAGS="-O2 -Wno-stringop-overread"
+go run -a .
 ```
 
 Build a binary:
 
 ```powershell
-go build -o amogus.exe .
-./amogus.exe
+go clean -cache
+go build -a -o amogus.exe .
+.\amogus.exe
 ```
 
-## Docker
+### Docker
 
-The Docker image builds a static Go binary, installs `ffmpeg`, `yt-dlp`, and the Python search sidecar dependencies, then starts both the sidecar and the bot.
+The Docker image builds the Go binary, installs `ffmpeg`, `yt-dlp`, and the Python search sidecar dependencies, then starts both the sidecar and the bot.
 
 ```bash
 docker build -t amogus .
@@ -110,7 +140,7 @@ docker run --rm \
 
 Never bake tokens into the image. Use your hosting platform's secret manager or encrypted environment variables.
 
-## Hosting Notes
+### Hosting Notes
 
 This bot needs a long-running process for the Discord gateway and voice connection. Free web services that sleep after idle time will disconnect the bot.
 
@@ -122,31 +152,6 @@ Reasonable options:
 | Oracle Cloud Free Tier | See [docs/oracle-cloud.md](docs/oracle-cloud.md). |
 | Fly.io / Railway / other PaaS | Use Docker and configure secrets in the dashboard. Confirm the plan does not sleep. |
 
-## Slash Commands
-
-Join a voice channel, then use the commands in a text channel where the bot can respond.
-
-| Command | Description |
-|---------|-------------|
-| `/play query:<query or URL>` | Search YouTube Music, play a single YouTube URL, or queue a playlist URL containing `list=`. Playlists resolve in pages so playback can start before the full list is fetched. Limit: 200 tracks per request. |
-| `/skip` | Skip the current track and continue with the queue. |
-| `/stop` | Stop playback, clear the queue, and disconnect from voice. |
-| `/shuffle` | Shuffle the queued tracks. |
-| `/remove index:<number>` | Remove an upcoming track by queue number. |
-| `/move from:<number> to:<number>` | Move an upcoming track to a new queue position. |
-| `/clear` | Clear upcoming tracks without stopping the current song. |
-| `/queue [page]` | Show the current track, upcoming tracks, queue count, and autoplay status. |
-| `/autoplay [enabled]` | Toggle autoplay, or set it explicitly with `enabled:true` / `enabled:false`. When enabled, the bot adds a related YouTube Music radio suggestion after the queue runs out. |
-
-## Behavior Notes
-
-- Playback is streamed through pipes; the bot should not create `audio.mp3*` temporary files.
-- `/autoplay` is per server for the current voice session and resets when playback is stopped or the bot disconnects.
-- Autoplay skips recently played video IDs to avoid immediately looping the same suggestions.
-- `/stop` clears playback state and prevents autoplay from requeueing after a manual stop.
-- If the bot is kicked from voice, the queue is cleared and it will not auto-rejoin.
-- After playback ends, the bot disconnects from voice after 15 minutes of inactivity.
-
 ## Troubleshooting
 
 | Problem | Things to check |
@@ -155,7 +160,17 @@ Join a voice channel, then use the commands in a text channel where the bot can 
 | No search/autocomplete/autoplay suggestions | Confirm `python search.py` is running on `127.0.0.1:5000` and that `flask`, `waitress`, and `ytmusicapi` are installed. |
 | Playlist errors | Use the full YouTube URL including `list=...`; the API key must have YouTube Data API v3 enabled and quota available. |
 | Voice 4017 / DAVE errors | Keep the `discordgo` replace in `go.mod` until upstream DAVE support is available. |
-| Slash commands do not appear | Reinvite with the `applications.commands` scope, then restart the bot so it bulk-overwrites command definitions. |
+| Slash commands do not appear | Restart the bot so it bulk-overwrites commands, then refresh Discord with `Ctrl+R`. |
+
+## Audio Pipeline
+
+The bot streams directly:
+
+```text
+yt-dlp stdout -> ffmpeg libopus OGG stdout -> OGG demux -> Discord OpusSend
+```
+
+There is no Go-side PCM decode/encode step.
 
 ## License
 
