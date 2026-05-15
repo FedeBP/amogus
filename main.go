@@ -201,6 +201,48 @@ func (gs *guildState) stopAfterAutoplayError(generation uint64) bool {
 	return true
 }
 
+type autoplaySkipRequest struct {
+	seed           Track
+	voiceChannelID string
+	excluded       map[string]struct{}
+	history        []Track
+}
+
+func (gs *guildState) prepareSkip() (autoplaySkipRequest, bool) {
+	gs.mu.Lock()
+	autoplaySkip := gs.isPlaying &&
+		gs.autoplayEnabled &&
+		len(gs.songQueue) == 0 &&
+		trackVideoID(gs.lastPlayed) != "" &&
+		gs.lastVoiceChannelID != ""
+	req := autoplaySkipRequest{}
+	if autoplaySkip {
+		req = autoplaySkipRequest{
+			seed:           gs.lastPlayed,
+			voiceChannelID: gs.lastVoiceChannelID,
+			excluded:       gs.autoplayExclusionsLocked(),
+			history:        gs.autoplayHistoryLocked(),
+		}
+	}
+	gs.mu.Unlock()
+
+	if !autoplaySkip {
+		gs.interruptPlayback()
+		return autoplaySkipRequest{}, false
+	}
+
+	gs.playbackGeneration.Add(1)
+	gs.interruptPlayback()
+	gs.mu.Lock()
+	gs.isPlaying = false
+	if gs.disconnectTimer != nil {
+		gs.disconnectTimer.Stop()
+		gs.disconnectTimer = nil
+	}
+	gs.mu.Unlock()
+	return req, true
+}
+
 // resetPlaybackState clears the queue, kills active processes, and cancels
 // any pending idle-disconnect timer. Used by /stop and external kicks.
 func (gs *guildState) resetPlaybackState() {
@@ -250,14 +292,19 @@ var (
 
 	errNotInVoice      = errors.New("not in a voice channel")
 	errPlaylistMaxSize = errors.New("playlist max size reached")
+
+	queuePageMinValue = 1.0
 )
 
 const (
 	maxPlaylistTracks      = 200
 	discordChoiceNameMax   = 100
-	autoplayCandidateLimit = 25
+	autoplayCandidateLimit = 50
 	recentVideoMemory      = 50
 	recentTrackMemory      = 20
+	queuePageSize          = 10
+	queueLineMaxLen        = 120
+	discordFieldValueMax   = 1024
 	opusSendTimeout        = 2 * time.Second
 	opusSendPollInterval   = 20 * time.Millisecond
 )
@@ -312,6 +359,53 @@ var slashCommands = []*discordgo.ApplicationCommand{
 	{Name: "skip", Description: "Skip the current track"},
 	{Name: "stop", Description: "Stop playback and clear the queue"},
 	{Name: "shuffle", Description: "Shuffle the queue"},
+	{
+		Name:        "remove",
+		Description: "Remove a track from the queue",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionInteger,
+				Name:        "index",
+				Description: "Queue number to remove",
+				Required:    true,
+				MinValue:    &queuePageMinValue,
+			},
+		},
+	},
+	{
+		Name:        "move",
+		Description: "Move a queued track to another position",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionInteger,
+				Name:        "from",
+				Description: "Queue number to move",
+				Required:    true,
+				MinValue:    &queuePageMinValue,
+			},
+			{
+				Type:        discordgo.ApplicationCommandOptionInteger,
+				Name:        "to",
+				Description: "New queue position",
+				Required:    true,
+				MinValue:    &queuePageMinValue,
+			},
+		},
+	},
+	{Name: "clear", Description: "Clear queued tracks without stopping playback"},
+	{
+		Name:        "queue",
+		Description: "Show what is playing and what is queued",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:        discordgo.ApplicationCommandOptionInteger,
+				Name:        "page",
+				Description: "Queue page to show",
+				Required:    false,
+				MinValue:    &queuePageMinValue,
+			},
+		},
+	},
 	{
 		Name:        "autoplay",
 		Description: "Toggle related-track autoplay when the queue ends",
@@ -824,6 +918,33 @@ func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResul
 	return results, nil
 }
 
+func chooseAutoplayTrack(results []SearchResult, excluded map[string]struct{}, history []Track) (Track, error) {
+	var best Track
+	bestScore := -1 << 30
+
+	for i, r := range results {
+		if r.VideoID == "" {
+			continue
+		}
+		if _, seen := excluded[r.VideoID]; seen {
+			continue
+		}
+		track := trackFromSearchResult(r)
+		score := autoplayCandidateScore(track, history, i)
+		if autoplayNearDuplicate(track, history) {
+			continue
+		}
+		if score > bestScore {
+			best = track
+			bestScore = score
+		}
+	}
+	if best.URL != "" {
+		return best, nil
+	}
+	return Track{}, errors.New("no fresh radio suggestions found")
+}
+
 func resolveAutoplayTrack(ctx context.Context, seed Track, excluded map[string]struct{}, history []Track) (Track, error) {
 	seedID := trackVideoID(seed)
 	if seedID == "" {
@@ -834,29 +955,7 @@ func resolveAutoplayTrack(ctx context.Context, seed Track, excluded map[string]s
 	if err != nil {
 		return Track{}, err
 	}
-	var best Track
-	bestScore := -1 << 30
-	for i, r := range results {
-		if r.VideoID == "" {
-			continue
-		}
-		if _, seen := excluded[r.VideoID]; seen {
-			continue
-		}
-		track := trackFromSearchResult(r)
-		if autoplayNearDuplicate(track, history) {
-			continue
-		}
-		score := autoplayCandidateScore(track, history, i)
-		if score > bestScore {
-			best = track
-			bestScore = score
-		}
-	}
-	if best.URL != "" {
-		return best, nil
-	}
-	return Track{}, errors.New("no fresh radio suggestions found")
+	return chooseAutoplayTrack(results, excluded, history)
 }
 
 // youtubeAutocompleteChoices returns Discord autocomplete choices for the
@@ -1127,7 +1226,7 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 
 		sendNowPlayingEmbed(s, textChannelID, song.track)
 
-		if err := streamAudio(gs, vc, dl, song.track.URL); err != nil {
+		if err := streamAudio(gs, vc, dl, song.track.URL, generation); err != nil {
 			if gs.playbackGeneration.Load() != generation {
 				return
 			}
@@ -1183,6 +1282,141 @@ func sendNowPlayingEmbed(s *discordgo.Session, textChannelID string, t Track) {
 		Description: description,
 		URL:         t.URL,
 	})
+}
+
+type queueSnapshot struct {
+	current         Track
+	hasCurrent      bool
+	queued          []Song
+	autoplayEnabled bool
+	isPlaying       bool
+}
+
+func (gs *guildState) snapshotQueue() queueSnapshot {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	queued := make([]Song, len(gs.songQueue))
+	copy(queued, gs.songQueue)
+	snapshot := queueSnapshot{
+		queued:          queued,
+		autoplayEnabled: gs.autoplayEnabled,
+		isPlaying:       gs.isPlaying,
+	}
+	if gs.isPlaying && trackHasDisplay(gs.lastPlayed) {
+		snapshot.current = gs.lastPlayed
+		snapshot.hasCurrent = true
+	}
+	return snapshot
+}
+
+func buildQueueEmbed(gs *guildState, page int) *discordgo.MessageEmbed {
+	snapshot := gs.snapshotQueue()
+	if page < 1 {
+		page = 1
+	}
+	totalQueued := len(snapshot.queued)
+	totalPages := 1
+	if totalQueued > 0 {
+		totalPages = (totalQueued + queuePageSize - 1) / queuePageSize
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+
+	status := "Idle"
+	if snapshot.isPlaying {
+		status = "Playing"
+	}
+	autoplay := "Off"
+	if snapshot.autoplayEnabled {
+		autoplay = "On"
+	}
+
+	nowPlaying := "Nothing right now."
+	if snapshot.hasCurrent {
+		nowPlaying = formatQueueTrack(snapshot.current)
+	}
+
+	upNext := "Queue is empty."
+	if totalQueued > 0 {
+		start := (page - 1) * queuePageSize
+		end := start + queuePageSize
+		if end > totalQueued {
+			end = totalQueued
+		}
+		lines := make([]string, 0, end-start)
+		for i, song := range snapshot.queued[start:end] {
+			lines = append(lines, fmt.Sprintf("%d. %s", start+i+1, formatQueueTrack(song.track)))
+		}
+		upNext = truncateFieldValue(strings.Join(lines, "\n"))
+	}
+
+	return &discordgo.MessageEmbed{
+		Title: "Queue",
+		Description: fmt.Sprintf(
+			"Status: %s\nAutoplay: %s\nQueued: %d",
+			status,
+			autoplay,
+			totalQueued,
+		),
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "Now Playing",
+				Value:  truncateFieldValue(nowPlaying),
+				Inline: false,
+			},
+			{
+				Name:   "Up Next",
+				Value:  upNext,
+				Inline: false,
+			},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("Page %d/%d", page, totalPages),
+		},
+	}
+}
+
+func trackHasDisplay(t Track) bool {
+	return strings.TrimSpace(t.Title) != "" || strings.TrimSpace(t.URL) != ""
+}
+
+func formatQueueTrack(t Track) string {
+	title := strings.TrimSpace(t.Title)
+	if title == "" {
+		title = strings.TrimSpace(t.URL)
+	}
+	if title == "" {
+		title = "Unknown track"
+	}
+	title = truncateRunes(title, queueLineMaxLen)
+	parts := []string{title}
+	if artist := strings.TrimSpace(t.Artist); artist != "" {
+		parts = append(parts, "- "+truncateRunes(artist, queueLineMaxLen))
+	}
+	if duration := strings.TrimSpace(t.Duration); duration != "" {
+		parts = append(parts, "["+duration+"]")
+	}
+	return truncateRunes(strings.Join(parts, " "), queueLineMaxLen)
+}
+
+func truncateFieldValue(s string) string {
+	return truncateRunes(s, discordFieldValueMax)
+}
+
+func truncateRunes(s string, max int) string {
+	runes := []rune(strings.TrimSpace(s))
+	if max <= 0 || len(runes) <= max {
+		return string(runes)
+	}
+	if max == 1 {
+		return string(runes[:1])
+	}
+	if max <= 3 {
+		return string(runes[:max])
+	}
+	return string(runes[:max-3]) + "..."
 }
 
 // ---------------------------------------------------------------------------
@@ -1300,7 +1534,7 @@ func streamProcessError(reason string, err error, dlStderr, ffStderr *bytes.Buff
 	return fmt.Errorf("%s: %w; %s", reason, err, strings.Join(details, " | "))
 }
 
-func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte) error {
+func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte, generation uint64) error {
 	if vc == nil || vc.OpusSend == nil {
 		return errors.New("voice connection is not ready to send audio")
 	}
@@ -1309,7 +1543,7 @@ func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte) e
 	ticker := time.NewTicker(opusSendPollInterval)
 	defer ticker.Stop()
 	for {
-		if gs.skipInterrupt.Load() {
+		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 			return nil
 		}
 		select {
@@ -1334,7 +1568,7 @@ func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte) e
 //
 // The two Opus header pages (identification + comment) are skipped;
 // every audio packet thereafter is sent as-is.
-func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string) error {
+func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string, generation uint64) error {
 	var dlStderr, ffStderr bytes.Buffer
 
 	dlCmd := exec.Command(dl,
@@ -1396,11 +1630,11 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 	// Skip the two mandatory Opus header pages (identification + comment).
 	// pageIndex 0 = OpusHead, pageIndex 1 = OpusTags.
 	for skip := 0; skip < 2; skip++ {
-		if gs.skipInterrupt.Load() {
+		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 			break
 		}
 		if _, err := readOggPage(ffStdout); err != nil {
-			if gs.skipInterrupt.Load() {
+			if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 				break
 			}
 			_ = dlCmd.Process.Kill()
@@ -1412,7 +1646,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 
 	// Stream audio pages until EOF or skip signal.
 	for {
-		if gs.skipInterrupt.Load() {
+		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 			break
 		}
 
@@ -1421,7 +1655,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break // normal end of stream
 			}
-			if gs.skipInterrupt.Load() {
+			if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 				break
 			}
 			_ = dlCmd.Process.Kill()
@@ -1431,11 +1665,11 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		}
 
 		for _, pkt := range page.packets {
-			if gs.skipInterrupt.Load() {
+			if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 				break
 			}
 			if len(pkt) > 0 {
-				if err := sendOpusPacket(gs, vc, pkt); err != nil {
+				if err := sendOpusPacket(gs, vc, pkt, generation); err != nil {
 					_ = dlCmd.Process.Kill()
 					_ = ffCmd.Process.Kill()
 					_, _ = dlCmd.Wait(), ffCmd.Wait()
@@ -1445,14 +1679,14 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		}
 	}
 
-	if gs.skipInterrupt.Load() {
+	if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 		_ = dlCmd.Process.Kill()
 		_ = ffCmd.Process.Kill()
 	}
 
 	dlErr := dlCmd.Wait()
 	ffErr := ffCmd.Wait()
-	if gs.skipInterrupt.Load() {
+	if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 		return nil
 	}
 	if dlErr != nil {
@@ -1533,8 +1767,7 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		case "play":
 			handleSlashPlay(s, i)
 		case "skip":
-			gs.interruptPlayback()
-			_ = respondEphemeral(s, i, "Skipped.")
+			handleSlashSkip(s, i, gs)
 		case "stop":
 			gs.resetPlaybackState()
 			s.RLock()
@@ -1559,10 +1792,50 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			}
 			gs.mu.Unlock()
 			_ = respondEphemeral(s, i, "Queue shuffled.")
+		case "queue":
+			handleSlashQueue(s, i, gs)
 		case "autoplay":
 			handleSlashAutoplay(s, i, gs)
 		}
 	}
+}
+
+func handleSlashSkip(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	req, shouldAutoplay := gs.prepareSkip()
+	if !shouldAutoplay {
+		_ = respondEphemeral(s, i, "Skipped.")
+		return
+	}
+
+	_ = respondEphemeral(s, i, "Skipped. Finding another related track...")
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		nextTrack, err := resolveAutoplayTrack(ctx, req.seed, req.excluded, req.history)
+		cancel()
+		if err != nil {
+			log.Printf("skip autoplay: %v", err)
+			_, _ = s.ChannelMessageSend(i.ChannelID, "Autoplay could not find another related track.")
+			return
+		}
+		_ = enqueueTrack(s, i.GuildID, i.ChannelID, req.voiceChannelID, nextTrack)
+	}()
+}
+
+func handleSlashQueue(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	page := 1
+	for _, opt := range i.ApplicationCommandData().Options {
+		if opt.Name == "page" {
+			page = int(opt.IntValue())
+			break
+		}
+	}
+	_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{buildQueueEmbed(gs, page)},
+			Flags:  discordgo.MessageFlagsEphemeral,
+		},
+	})
 }
 
 func handleSlashAutoplay(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
