@@ -15,7 +15,6 @@ package main
 // than bouncing through a Go ↔ Cgo ↔ libopus round-trip per 20 ms frame.
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -28,9 +27,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -55,6 +58,9 @@ var (
 	APIKey    string
 	config    *configStruct
 	BotID     string
+
+	maxConcurrentStreams = defaultMaxConcurrentStreams()
+	audioStreamSlots     = make(chan struct{}, maxConcurrentStreams)
 )
 
 // GetConfig loads configuration from config.json and then overrides any
@@ -97,7 +103,41 @@ func GetConfig() {
 	}
 
 	config = &configStruct{Token: Token, BotPrefix: BotPrefix, APIKey: APIKey}
+	configureResourceLimits()
 	log.Printf("Configuration loaded.")
+}
+
+func defaultMaxConcurrentStreams() int {
+	n := runtime.GOMAXPROCS(0)
+	if n < 1 {
+		return 1
+	}
+	if n > 2 {
+		return 2
+	}
+	return n
+}
+
+func configureResourceLimits() {
+	maxConcurrentStreams = positiveIntEnv("MAX_CONCURRENT_STREAMS", defaultMaxConcurrentStreams())
+	audioStreamSlots = make(chan struct{}, maxConcurrentStreams)
+	log.Printf("Resource limits: max concurrent streams=%d", maxConcurrentStreams)
+}
+
+func positiveIntEnv(name string, fallback int) int {
+	if fallback < 1 {
+		fallback = 1
+	}
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		log.Printf("Ignoring invalid %s=%q; using %d", name, raw, fallback)
+		return fallback
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------------
@@ -302,9 +342,12 @@ const (
 	autoplayCandidateLimit = 50
 	recentVideoMemory      = 50
 	recentTrackMemory      = 20
+	maxSearchCacheEntries  = 512
+	maxTrackCacheEntries   = 1000
 	queuePageSize          = 10
 	queueLineMaxLen        = 120
 	discordFieldValueMax   = 1024
+	processStderrTailBytes = 4096
 	opusSendTimeout        = 2 * time.Second
 	opusSendPollInterval   = 20 * time.Millisecond
 )
@@ -426,13 +469,13 @@ var slashCommands = []*discordgo.ApplicationCommand{
 
 func main() {
 	GetConfig()
-	Start()
-	<-make(chan struct{}) // block forever; bot runs on goroutines/handlers
+	session := Start()
+	waitForShutdown(session)
 }
 
 // Start initialises the Discord session, registers event handlers,
 // and opens the WebSocket gateway connection.
-func Start() {
+func Start() *discordgo.Session {
 	session, err := discordgo.New("Bot " + Token)
 	if err != nil {
 		log.Fatalf("Couldn't initialise bot: %v", err)
@@ -466,7 +509,74 @@ func Start() {
 	if err = session.Open(); err != nil {
 		log.Fatalf("Error opening session: %v", err)
 	}
-	log.Printf("Bot initialised successfully. 👾")
+	log.Printf("Bot initialised successfully.")
+	return session
+}
+
+func waitForShutdown(session *discordgo.Session) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigCh
+	log.Printf("Received %s; shutting down.", sig)
+	shutdownBot(session)
+}
+
+func shutdownBot(session *discordgo.Session) {
+	shutdownAllGuilds()
+	if session == nil {
+		return
+	}
+	session.RLock()
+	voiceConnections := make([]*discordgo.VoiceConnection, 0, len(session.VoiceConnections))
+	for _, vc := range session.VoiceConnections {
+		voiceConnections = append(voiceConnections, vc)
+	}
+	session.RUnlock()
+	for _, vc := range voiceConnections {
+		if err := disconnectVoiceConnection(vc); err != nil {
+			log.Printf("shutdown voice disconnect: %v", err)
+		}
+	}
+	if err := session.Close(); err != nil {
+		log.Printf("discord session close: %v", err)
+	}
+}
+
+func shutdownAllGuilds() {
+	guildsMu.Lock()
+	states := make([]*guildState, 0, len(guilds))
+	for _, gs := range guilds {
+		states = append(states, gs)
+	}
+	guildsMu.Unlock()
+	for _, gs := range states {
+		gs.resetPlaybackState()
+	}
+}
+
+func acquireAudioStreamSlot(gs *guildState, generation uint64) bool {
+	if audioStreamSlots == nil {
+		configureResourceLimits()
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
+			return false
+		}
+		select {
+		case audioStreamSlots <- struct{}{}:
+			return true
+		case <-ticker.C:
+		}
+	}
+}
+
+func releaseAudioStreamSlot() {
+	select {
+	case <-audioStreamSlots:
+	default:
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +903,31 @@ func cacheTrackMetadataLocked(results []SearchResult, expires time.Time) {
 	}
 }
 
+func pruneSearchCachesLocked(now time.Time) {
+	for query, cached := range searchCache {
+		if now.After(cached.expires) {
+			delete(searchCache, query)
+		}
+	}
+	for videoID, cached := range trackMetadataCache {
+		if now.After(cached.expires) {
+			delete(trackMetadataCache, videoID)
+		}
+	}
+	for len(searchCache) > maxSearchCacheEntries {
+		for query := range searchCache {
+			delete(searchCache, query)
+			break
+		}
+	}
+	for len(trackMetadataCache) > maxTrackCacheEntries {
+		for videoID := range trackMetadataCache {
+			delete(trackMetadataCache, videoID)
+			break
+		}
+	}
+}
+
 func cachedTrackByVideoID(videoID string) (Track, bool) {
 	searchCacheMu.Lock()
 	defer searchCacheMu.Unlock()
@@ -876,6 +1011,7 @@ func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 		expires: expires,
 	}
 	cacheTrackMetadataLocked(results, expires)
+	pruneSearchCachesLocked(time.Now())
 	searchCacheMu.Unlock()
 
 	return results, nil
@@ -914,6 +1050,7 @@ func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResul
 	}
 	searchCacheMu.Lock()
 	cacheTrackMetadataLocked(results, time.Now().Add(10*time.Minute))
+	pruneSearchCachesLocked(time.Now())
 	searchCacheMu.Unlock()
 	return results, nil
 }
@@ -1207,8 +1344,13 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 
 		gs.skipInterrupt.Store(false)
 
+		if !acquireAudioStreamSlot(gs, generation) {
+			return
+		}
+
 		vc, err := s.ChannelVoiceJoin(song.guildID, song.channelID, false, true)
 		if err != nil {
+			releaseAudioStreamSlot()
 			if gs.playbackGeneration.Load() != generation {
 				return
 			}
@@ -1226,7 +1368,9 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 
 		sendNowPlayingEmbed(s, textChannelID, song.track)
 
-		if err := streamAudio(gs, vc, dl, song.track.URL, generation); err != nil {
+		err = streamAudio(gs, vc, dl, song.track.URL, generation)
+		releaseAudioStreamSlot()
+		if err != nil {
 			if gs.playbackGeneration.Load() != generation {
 				return
 			}
@@ -1561,19 +1705,44 @@ func readOggPage(r io.Reader) (*oggPage, error) {
 // Audio streaming
 // ---------------------------------------------------------------------------
 
-func processOutputTail(name string, stderr *bytes.Buffer) string {
+type tailBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func newTailBuffer(max int) *tailBuffer {
+	if max < 1 {
+		max = processStderrTailBytes
+	}
+	return &tailBuffer{max: max}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.max {
+		b.buf = append([]byte(nil), b.buf[len(b.buf)-b.max:]...)
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
+
+func processOutputTail(name string, stderr *tailBuffer) string {
 	output := strings.TrimSpace(stderr.String())
 	if output == "" {
 		return ""
 	}
-	const maxOutputLen = 2000
-	if len(output) > maxOutputLen {
-		output = output[len(output)-maxOutputLen:]
-	}
 	return name + " stderr: " + output
 }
 
-func streamProcessError(reason string, err error, dlStderr, ffStderr *bytes.Buffer) error {
+func streamProcessError(reason string, err error, dlStderr, ffStderr *tailBuffer) error {
 	details := make([]string, 0, 2)
 	if output := processOutputTail("yt-dlp", dlStderr); output != "" {
 		details = append(details, output)
@@ -1622,7 +1791,8 @@ func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte, g
 // The two Opus header pages (identification + comment) are skipped;
 // every audio packet thereafter is sent as-is.
 func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string, generation uint64) error {
-	var dlStderr, ffStderr bytes.Buffer
+	dlStderr := newTailBuffer(processStderrTailBytes)
+	ffStderr := newTailBuffer(processStderrTailBytes)
 
 	dlCmd := exec.Command(dl,
 		"--no-playlist",
@@ -1630,7 +1800,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		"-o", "-",
 		youtubeURL,
 	)
-	dlCmd.Stderr = &dlStderr
+	dlCmd.Stderr = dlStderr
 
 	ffCmd := exec.Command("ffmpeg",
 		"-i", "pipe:0",
@@ -1642,7 +1812,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		"-f", "ogg",
 		"pipe:1",
 	)
-	ffCmd.Stderr = &ffStderr
+	ffCmd.Stderr = ffStderr
 
 	dlStdout, err := dlCmd.StdoutPipe()
 	if err != nil {
@@ -1656,11 +1826,11 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 	}
 
 	if err := dlCmd.Start(); err != nil {
-		return streamProcessError("yt-dlp start", err, &dlStderr, &ffStderr)
+		return streamProcessError("yt-dlp start", err, dlStderr, ffStderr)
 	}
 	if err := ffCmd.Start(); err != nil {
 		_ = dlCmd.Process.Kill()
-		return streamProcessError("ffmpeg start", err, &dlStderr, &ffStderr)
+		return streamProcessError("ffmpeg start", err, dlStderr, ffStderr)
 	}
 
 	// Register active processes so skip/stop can kill them immediately.
@@ -1693,7 +1863,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 			_ = dlCmd.Process.Kill()
 			_ = ffCmd.Process.Kill()
 			_, _ = dlCmd.Wait(), ffCmd.Wait()
-			return streamProcessError(fmt.Sprintf("ogg header page %d", skip), err, &dlStderr, &ffStderr)
+			return streamProcessError(fmt.Sprintf("ogg header page %d", skip), err, dlStderr, ffStderr)
 		}
 	}
 
@@ -1714,7 +1884,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 			_ = dlCmd.Process.Kill()
 			_ = ffCmd.Process.Kill()
 			_, _ = dlCmd.Wait(), ffCmd.Wait()
-			return streamProcessError("ogg demux", err, &dlStderr, &ffStderr)
+			return streamProcessError("ogg demux", err, dlStderr, ffStderr)
 		}
 
 		for _, pkt := range page.packets {
@@ -1743,10 +1913,10 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 		return nil
 	}
 	if dlErr != nil {
-		return streamProcessError("yt-dlp exit", dlErr, &dlStderr, &ffStderr)
+		return streamProcessError("yt-dlp exit", dlErr, dlStderr, ffStderr)
 	}
 	if ffErr != nil {
-		return streamProcessError("ffmpeg exit", ffErr, &dlStderr, &ffStderr)
+		return streamProcessError("ffmpeg exit", ffErr, dlStderr, ffStderr)
 	}
 	return nil
 }

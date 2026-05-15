@@ -53,6 +53,75 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	}
 }
 
+func TestPositiveIntEnv(t *testing.T) {
+	t.Setenv("AMOGUS_TEST_POSITIVE_INT", "3")
+	if got := positiveIntEnv("AMOGUS_TEST_POSITIVE_INT", 1); got != 3 {
+		t.Fatalf("positiveIntEnv() = %d, want 3", got)
+	}
+
+	t.Setenv("AMOGUS_TEST_POSITIVE_INT", "nope")
+	if got := positiveIntEnv("AMOGUS_TEST_POSITIVE_INT", 2); got != 2 {
+		t.Fatalf("positiveIntEnv() with invalid value = %d, want fallback 2", got)
+	}
+
+	t.Setenv("AMOGUS_TEST_POSITIVE_INT", "0")
+	if got := positiveIntEnv("AMOGUS_TEST_POSITIVE_INT", 2); got != 2 {
+		t.Fatalf("positiveIntEnv() with zero = %d, want fallback 2", got)
+	}
+}
+
+func TestTailBufferKeepsOnlyTail(t *testing.T) {
+	buf := newTailBuffer(5)
+
+	n, err := buf.Write([]byte("hello"))
+	if err != nil || n != 5 {
+		t.Fatalf("first Write() = %d, %v; want 5, nil", n, err)
+	}
+	n, err = buf.Write([]byte(" world"))
+	if err != nil || n != 6 {
+		t.Fatalf("second Write() = %d, %v; want 6, nil", n, err)
+	}
+	if got := buf.String(); got != "world" {
+		t.Fatalf("buffer tail = %q, want world", got)
+	}
+}
+
+func TestPruneSearchCachesLockedRemovesExpiredEntries(t *testing.T) {
+	searchCacheMu.Lock()
+	oldSearchCache := searchCache
+	oldTrackCache := trackMetadataCache
+	defer func() {
+		searchCache = oldSearchCache
+		trackMetadataCache = oldTrackCache
+		searchCacheMu.Unlock()
+	}()
+
+	now := time.Now()
+	searchCache = map[string]cachedSearch{
+		"expired": {expires: now.Add(-time.Minute)},
+		"fresh":   {expires: now.Add(time.Minute)},
+	}
+	trackMetadataCache = map[string]cachedTrackMetadata{
+		"expired": {expires: now.Add(-time.Minute)},
+		"fresh":   {expires: now.Add(time.Minute)},
+	}
+
+	pruneSearchCachesLocked(now)
+
+	if _, ok := searchCache["expired"]; ok {
+		t.Fatal("expired search cache entry was not pruned")
+	}
+	if _, ok := searchCache["fresh"]; !ok {
+		t.Fatal("fresh search cache entry was pruned")
+	}
+	if _, ok := trackMetadataCache["expired"]; ok {
+		t.Fatal("expired track metadata entry was not pruned")
+	}
+	if _, ok := trackMetadataCache["fresh"]; !ok {
+		t.Fatal("fresh track metadata entry was pruned")
+	}
+}
+
 func TestStopAfterAutoplayErrorKeepsLoopAliveForQueuedTrack(t *testing.T) {
 	gs := &guildState{
 		songQueue: []Song{

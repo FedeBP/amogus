@@ -81,6 +81,7 @@ Environment variables override `config.json`:
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `YOUTUBE_API_KEY` | YouTube Data API v3 key |
 | `BOT_PREFIX` | Legacy prefix field |
+| `MAX_CONCURRENT_STREAMS` | Optional per-process cap for active `yt-dlp`/`ffmpeg` audio pipelines. Defaults to the smaller of 2 or `GOMAXPROCS`. |
 
 Keep secrets out of Git. `config.json` is ignored by this repo.
 
@@ -143,6 +144,8 @@ Never bake tokens into the image. Use your hosting platform's secret manager or 
 ### Hosting Notes
 
 This bot needs a long-running process for the Discord gateway and voice connection. Free web services that sleep after idle time will disconnect the bot.
+
+For Fly.io, prefer one active bot gateway process per Discord token unless you add proper sharding or leader election. Multiple identical machines with the same token can receive the same events and fight over voice state. Extra CPU/RAM is still useful on a single active machine; set `MAX_CONCURRENT_STREAMS` to control how many external audio pipelines can run at once on that machine.
 
 Reasonable options:
 
