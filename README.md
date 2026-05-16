@@ -8,7 +8,7 @@ The bot is built for small-server use: join voice, queue music from chat, keep t
 
 1. Join a voice channel.
 2. Use `/play query:<song, artist, YouTube URL, or playlist URL>` in a text channel where the bot can respond.
-3. Manage playback and the queue with slash commands.
+3. Manage playback and the queue with the Now Playing buttons or slash commands.
 
 The bot searches YouTube Music for normal text queries. It also accepts direct YouTube video URLs and playlist URLs containing `list=`.
 
@@ -25,6 +25,8 @@ The bot searches YouTube Music for normal text queries. It also accepts direct Y
 | `/move from:<number> to:<number>` | Moves an upcoming track to another queue position. |
 | `/clear` | Clears upcoming tracks without stopping the current song. |
 | `/autoplay [enabled]` | Toggles autoplay, or sets it with `enabled:true` / `enabled:false`. |
+
+Now Playing messages also include buttons for skip, stop, queue, and autoplay.
 
 ## Autoplay
 
@@ -43,7 +45,7 @@ When autoplay is enabled and the queue runs out, the bot asks the YouTube Music 
 
 - The bot should not auto-rejoin when someone disconnects it from voice.
 - If the bot is kicked from voice, playback state and autoplay are cleared.
-- After playback ends, the bot disconnects after 15 minutes of inactivity.
+- After playback ends, the bot disconnects after 10 minutes of inactivity.
 - Search, autocomplete, and autoplay suggestions require the local Python sidecar.
 
 ## Operator Setup
@@ -81,7 +83,6 @@ Environment variables override `config.json`:
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `YOUTUBE_API_KEY` | YouTube Data API v3 key |
 | `BOT_PREFIX` | Legacy prefix field |
-| `MAX_CONCURRENT_STREAMS` | Optional per-process cap for active `yt-dlp`/`ffmpeg` audio pipelines. Defaults to the smaller of 2 or `GOMAXPROCS`. |
 
 Keep secrets out of Git. `config.json` is ignored by this repo.
 
@@ -144,8 +145,6 @@ Never bake tokens into the image. Use your hosting platform's secret manager or 
 ### Hosting Notes
 
 This bot needs a long-running process for the Discord gateway and voice connection. Free web services that sleep after idle time will disconnect the bot.
-
-For Fly.io, prefer one active bot gateway process per Discord token unless you add proper sharding or leader election. Multiple identical machines with the same token can receive the same events and fight over voice state. Extra CPU/RAM is still useful on a single active machine; set `MAX_CONCURRENT_STREAMS` to control how many external audio pipelines can run at once on that machine.
 
 Reasonable options:
 

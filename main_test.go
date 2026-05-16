@@ -53,72 +53,63 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	}
 }
 
-func TestPositiveIntEnv(t *testing.T) {
-	t.Setenv("AMOGUS_TEST_POSITIVE_INT", "3")
-	if got := positiveIntEnv("AMOGUS_TEST_POSITIVE_INT", 1); got != 3 {
-		t.Fatalf("positiveIntEnv() = %d, want 3", got)
-	}
-
-	t.Setenv("AMOGUS_TEST_POSITIVE_INT", "nope")
-	if got := positiveIntEnv("AMOGUS_TEST_POSITIVE_INT", 2); got != 2 {
-		t.Fatalf("positiveIntEnv() with invalid value = %d, want fallback 2", got)
-	}
-
-	t.Setenv("AMOGUS_TEST_POSITIVE_INT", "0")
-	if got := positiveIntEnv("AMOGUS_TEST_POSITIVE_INT", 2); got != 2 {
-		t.Fatalf("positiveIntEnv() with zero = %d, want fallback 2", got)
+func TestIdleDisconnectTimeoutIsTenMinutes(t *testing.T) {
+	if idleDisconnectTimeout != 10*time.Minute {
+		t.Fatalf("idleDisconnectTimeout = %s, want 10m0s", idleDisconnectTimeout)
 	}
 }
 
-func TestTailBufferKeepsOnlyTail(t *testing.T) {
-	buf := newTailBuffer(5)
+func TestBuildNowPlayingComponentsAddsControlButtons(t *testing.T) {
+	components := buildNowPlayingComponents()
+	if len(components) != 1 {
+		t.Fatalf("components length = %d, want 1", len(components))
+	}
+	row, ok := components[0].(discordgo.ActionsRow)
+	if !ok {
+		t.Fatalf("component type = %T, want discordgo.ActionsRow", components[0])
+	}
 
-	n, err := buf.Write([]byte("hello"))
-	if err != nil || n != 5 {
-		t.Fatalf("first Write() = %d, %v; want 5, nil", n, err)
+	expected := []struct {
+		label    string
+		customID string
+		style    discordgo.ButtonStyle
+	}{
+		{label: "Skip", customID: nowPlayingButtonSkip, style: discordgo.PrimaryButton},
+		{label: "Stop", customID: nowPlayingButtonStop, style: discordgo.DangerButton},
+		{label: "Queue", customID: nowPlayingButtonQueue, style: discordgo.SecondaryButton},
+		{label: "Autoplay", customID: nowPlayingButtonAutoplay, style: discordgo.SecondaryButton},
 	}
-	n, err = buf.Write([]byte(" world"))
-	if err != nil || n != 6 {
-		t.Fatalf("second Write() = %d, %v; want 6, nil", n, err)
+
+	if len(row.Components) != len(expected) {
+		t.Fatalf("row components length = %d, want %d", len(row.Components), len(expected))
 	}
-	if got := buf.String(); got != "world" {
-		t.Fatalf("buffer tail = %q, want world", got)
+	for i, want := range expected {
+		button, ok := row.Components[i].(discordgo.Button)
+		if !ok {
+			t.Fatalf("button %d type = %T, want discordgo.Button", i, row.Components[i])
+		}
+		if button.Label != want.label || button.CustomID != want.customID || button.Style != want.style {
+			t.Fatalf("button %d = %#v, want label=%q customID=%q style=%d", i, button, want.label, want.customID, want.style)
+		}
 	}
 }
 
-func TestPruneSearchCachesLockedRemovesExpiredEntries(t *testing.T) {
-	searchCacheMu.Lock()
-	oldSearchCache := searchCache
-	oldTrackCache := trackMetadataCache
-	defer func() {
-		searchCache = oldSearchCache
-		trackMetadataCache = oldTrackCache
-		searchCacheMu.Unlock()
-	}()
+func TestSetAutoplayTogglesAndAppliesExplicitState(t *testing.T) {
+	gs := &guildState{}
 
-	now := time.Now()
-	searchCache = map[string]cachedSearch{
-		"expired": {expires: now.Add(-time.Minute)},
-		"fresh":   {expires: now.Add(time.Minute)},
+	if enabled := setAutoplay(gs, nil); !enabled {
+		t.Fatal("setAutoplay toggle = false, want true")
 	}
-	trackMetadataCache = map[string]cachedTrackMetadata{
-		"expired": {expires: now.Add(-time.Minute)},
-		"fresh":   {expires: now.Add(time.Minute)},
+	if !gs.autoplayEnabled {
+		t.Fatal("autoplayEnabled = false, want true")
 	}
 
-	pruneSearchCachesLocked(now)
-
-	if _, ok := searchCache["expired"]; ok {
-		t.Fatal("expired search cache entry was not pruned")
+	requested := false
+	if enabled := setAutoplay(gs, &requested); enabled {
+		t.Fatal("setAutoplay explicit false = true, want false")
 	}
-	if _, ok := searchCache["fresh"]; !ok {
-		t.Fatal("fresh search cache entry was pruned")
-	}
-	if _, ok := trackMetadataCache["expired"]; ok {
-		t.Fatal("expired track metadata entry was not pruned")
-	}
-	if _, ok := trackMetadataCache["fresh"]; !ok {
-		t.Fatal("fresh track metadata entry was pruned")
+	if gs.autoplayEnabled {
+		t.Fatal("autoplayEnabled = true, want false")
 	}
 }
 
