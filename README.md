@@ -146,6 +146,8 @@ Never bake tokens into the image. Use your hosting platform's secret manager or 
 
 This bot needs a long-running process for the Discord gateway and voice connection. Free web services that sleep after idle time will disconnect the bot.
 
+Within one bot process, music actions are serialized per Discord server so requests from one server do not overlap each other and requests from different servers can still proceed independently.
+
 For Fly.io, run one active machine per Discord bot token unless you add sharding or leader election. Multiple identical machines can receive the same interactions and fight over voice state. Use `fly scale count 1` for the current single-process bot.
 
 Reasonable options:

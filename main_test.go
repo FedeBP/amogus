@@ -113,6 +113,47 @@ func TestSetAutoplayTogglesAndAppliesExplicitState(t *testing.T) {
 	}
 }
 
+func TestGuildActionsRunInQueuedOrder(t *testing.T) {
+	gs := newGuildState()
+	defer close(gs.actionQueue)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan int, 2)
+
+	if !gs.enqueueAction(func() {
+		close(started)
+		<-release
+		done <- 1
+	}) {
+		t.Fatal("first enqueueAction() = false, want true")
+	}
+	if !gs.enqueueAction(func() {
+		done <- 2
+	}) {
+		t.Fatal("second enqueueAction() = false, want true")
+	}
+
+	<-started
+	select {
+	case got := <-done:
+		t.Fatalf("action %d completed before the first action released", got)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+	for want := 1; want <= 2; want++ {
+		select {
+		case got := <-done:
+			if got != want {
+				t.Fatalf("completed action = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for action %d", want)
+		}
+	}
+}
+
 func TestStopAfterAutoplayErrorKeepsLoopAliveForQueuedTrack(t *testing.T) {
 	gs := &guildState{
 		songQueue: []Song{

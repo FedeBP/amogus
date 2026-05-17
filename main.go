@@ -127,6 +127,8 @@ type SearchResult struct {
 	Duration string `json:"duration"`
 }
 
+type guildAction func()
+
 // ---------------------------------------------------------------------------
 // Per-guild playback state
 // ---------------------------------------------------------------------------
@@ -135,6 +137,7 @@ type SearchResult struct {
 // Keeping state per-guild ensures that multiple servers never interfere.
 type guildState struct {
 	mu                 sync.Mutex
+	actionQueue        chan guildAction
 	songQueue          []Song
 	isPlaying          bool
 	autoplayEnabled    bool
@@ -210,6 +213,33 @@ func (gs *guildState) disableAutoplayAfterPlaybackError(generation uint64) bool 
 	wasEnabled := gs.autoplayEnabled
 	gs.autoplayEnabled = false
 	return wasEnabled
+}
+
+func newGuildState() *guildState {
+	gs := &guildState{
+		actionQueue: make(chan guildAction, guildActionQueueSize),
+	}
+	go gs.runActions()
+	return gs
+}
+
+func (gs *guildState) runActions() {
+	for action := range gs.actionQueue {
+		action()
+	}
+}
+
+func (gs *guildState) enqueueAction(action guildAction) bool {
+	if gs.actionQueue == nil {
+		action()
+		return true
+	}
+	select {
+	case gs.actionQueue <- action:
+		return true
+	default:
+		return false
+	}
 }
 
 type autoplaySkipRequest struct {
@@ -288,7 +318,7 @@ func getGuildState(guildID string) *guildState {
 	if gs, ok := guilds[guildID]; ok {
 		return gs
 	}
-	gs := &guildState{}
+	gs := newGuildState()
 	guilds[guildID] = gs
 	return gs
 }
@@ -316,6 +346,7 @@ const (
 	queuePageSize          = 10
 	queueLineMaxLen        = 120
 	discordFieldValueMax   = 1024
+	guildActionQueueSize   = 64
 	idleDisconnectTimeout  = 5 * time.Minute
 	opusSendTimeout        = 2 * time.Second
 	opusSendPollInterval   = 20 * time.Millisecond
@@ -1839,14 +1870,27 @@ func respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, cont
 	})
 }
 
-func respondQueueEmbed(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState, page int) error {
+func deferInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, ephemeral bool) error {
+	data := &discordgo.InteractionResponseData{}
+	if ephemeral {
+		data.Flags = discordgo.MessageFlagsEphemeral
+	}
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Embeds: []*discordgo.MessageEmbed{buildQueueEmbed(gs, page)},
-			Flags:  discordgo.MessageFlagsEphemeral,
-		},
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: data,
 	})
+}
+
+func editInteractionContent(s *discordgo.Session, i *discordgo.InteractionCreate, content string) {
+	if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &content}); err != nil {
+		log.Printf("interaction edit: %v", err)
+	}
+}
+
+func editInteractionEmbeds(s *discordgo.Session, i *discordgo.InteractionCreate, embeds []*discordgo.MessageEmbed) {
+	if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Embeds: &embeds}); err != nil {
+		log.Printf("interaction embed edit: %v", err)
+	}
 }
 
 func stopPlayback(s *discordgo.Session, guildID string, gs *guildState) {
@@ -1887,19 +1931,22 @@ func skipPlayback(s *discordgo.Session, guildID, textChannelID string, gs *guild
 		return "Skipped."
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		nextTrack, err := resolveAutoplayTrack(ctx, req.seed, req.excluded, req.history)
-		cancel()
-		if err != nil {
-			log.Printf("skip autoplay: %v", err)
-			_, _ = s.ChannelMessageSend(textChannelID, "Autoplay could not find another related track.")
-			return
-		}
-		_ = enqueueTrack(s, guildID, textChannelID, req.voiceChannelID, nextTrack)
-	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	nextTrack, err := resolveAutoplayTrack(ctx, req.seed, req.excluded, req.history)
+	cancel()
+	if err != nil {
+		log.Printf("skip autoplay: %v", err)
+		return "Skipped. Autoplay could not find another related track."
+	}
+	_ = enqueueTrack(s, guildID, textChannelID, req.voiceChannelID, nextTrack)
+	return "Skipped. Queued another related track."
+}
 
-	return "Skipped. Finding another related track..."
+func enqueueDeferredAction(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState, action guildAction) {
+	if gs.enqueueAction(action) {
+		return
+	}
+	editInteractionContent(s, i, "This server has too many queued music actions. Try again in a moment.")
 }
 
 // interactionHandler dispatches both autocomplete and slash command events.
@@ -1939,66 +1986,91 @@ func interactionHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			return
 		}
 		gs := getGuildState(i.GuildID)
-		switch i.ApplicationCommandData().Name {
-		case "play":
-			handleSlashPlay(s, i)
-		case "skip":
-			handleSlashSkip(s, i, gs)
-		case "stop":
-			stopPlayback(s, i.GuildID, gs)
-			_ = respondEphemeral(s, i, "Stopped and cleared the queue.")
-		case "shuffle":
-			gs.mu.Lock()
-			n := len(gs.songQueue)
-			if n > 1 {
-				rngMu.Lock()
-				rng.Shuffle(n, func(i, j int) {
-					gs.songQueue[i], gs.songQueue[j] = gs.songQueue[j], gs.songQueue[i]
-				})
-				rngMu.Unlock()
-			}
-			gs.mu.Unlock()
-			_ = respondEphemeral(s, i, "Queue shuffled.")
-		case "remove":
-			handleSlashRemove(s, i, gs)
-		case "move":
-			handleSlashMove(s, i, gs)
-		case "clear":
-			handleSlashClear(s, i, gs)
-		case "queue":
-			handleSlashQueue(s, i, gs)
-		case "autoplay":
-			handleSlashAutoplay(s, i, gs)
+		if i.ApplicationCommandData().Name == "play" {
+			handleSlashPlay(s, i, gs)
+			return
 		}
+		if err := deferInteraction(s, i, true); err != nil {
+			log.Printf("slash defer: %v", err)
+			return
+		}
+		enqueueDeferredAction(s, i, gs, func() {
+			handleQueuedSlashCommand(s, i, gs)
+		})
 
 	case discordgo.InteractionMessageComponent:
 		if i.GuildID == "" {
 			_ = respondEphemeral(s, i, "Use this bot inside a server.")
 			return
 		}
-		handleNowPlayingButton(s, i, getGuildState(i.GuildID))
+		gs := getGuildState(i.GuildID)
+		if err := deferInteraction(s, i, true); err != nil {
+			log.Printf("component defer: %v", err)
+			return
+		}
+		enqueueDeferredAction(s, i, gs, func() {
+			handleNowPlayingButton(s, i, gs)
+		})
+	}
+}
+
+func handleQueuedSlashCommand(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	switch i.ApplicationCommandData().Name {
+	case "skip":
+		handleSlashSkip(s, i, gs)
+	case "stop":
+		stopPlayback(s, i.GuildID, gs)
+		editInteractionContent(s, i, "Stopped and cleared the queue.")
+	case "shuffle":
+		handleSlashShuffle(s, i, gs)
+	case "remove":
+		handleSlashRemove(s, i, gs)
+	case "move":
+		handleSlashMove(s, i, gs)
+	case "clear":
+		handleSlashClear(s, i, gs)
+	case "queue":
+		handleSlashQueue(s, i, gs)
+	case "autoplay":
+		handleSlashAutoplay(s, i, gs)
+	default:
+		editInteractionContent(s, i, "Unknown command.")
 	}
 }
 
 func handleNowPlayingButton(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
 	switch i.MessageComponentData().CustomID {
 	case nowPlayingButtonSkip:
-		_ = respondEphemeral(s, i, skipPlayback(s, i.GuildID, i.ChannelID, gs))
+		editInteractionContent(s, i, skipPlayback(s, i.GuildID, i.ChannelID, gs))
 	case nowPlayingButtonStop:
 		stopPlayback(s, i.GuildID, gs)
-		_ = respondEphemeral(s, i, "Stopped and cleared the queue.")
+		editInteractionContent(s, i, "Stopped and cleared the queue.")
 	case nowPlayingButtonQueue:
-		_ = respondQueueEmbed(s, i, gs, 1)
+		editInteractionEmbeds(s, i, []*discordgo.MessageEmbed{buildQueueEmbed(gs, 1)})
 	case nowPlayingButtonAutoplay:
 		enabled := setAutoplay(gs, nil)
-		_ = respondEphemeral(s, i, autoplayStatusMessage(enabled))
+		editInteractionContent(s, i, autoplayStatusMessage(enabled))
 	default:
-		_ = respondEphemeral(s, i, "That button is no longer available.")
+		editInteractionContent(s, i, "That button is no longer available.")
 	}
 }
 
 func handleSlashSkip(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
-	_ = respondEphemeral(s, i, skipPlayback(s, i.GuildID, i.ChannelID, gs))
+	editInteractionContent(s, i, skipPlayback(s, i.GuildID, i.ChannelID, gs))
+}
+
+func handleSlashShuffle(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
+	gs.mu.Lock()
+	n := len(gs.songQueue)
+	if n > 1 {
+		rngMu.Lock()
+		rng.Shuffle(n, func(i, j int) {
+			gs.songQueue[i], gs.songQueue[j] = gs.songQueue[j], gs.songQueue[i]
+		})
+		rngMu.Unlock()
+	}
+	gs.mu.Unlock()
+	editInteractionContent(s, i, "Queue shuffled.")
 }
 
 func handleSlashRemove(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
@@ -2011,10 +2083,10 @@ func handleSlashRemove(s *discordgo.Session, i *discordgo.InteractionCreate, gs 
 	}
 	removed, total, ok := gs.removeQueuedTrack(index)
 	if !ok {
-		_ = respondEphemeral(s, i, fmt.Sprintf("There is no queued track #%d. Queue size: %d.", index, total))
+		editInteractionContent(s, i, fmt.Sprintf("There is no queued track #%d. Queue size: %d.", index, total))
 		return
 	}
-	_ = respondEphemeral(s, i, fmt.Sprintf("Removed #%d: %s", index, formatQueueTrack(removed)))
+	editInteractionContent(s, i, fmt.Sprintf("Removed #%d: %s", index, formatQueueTrack(removed)))
 }
 
 func handleSlashMove(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
@@ -2029,23 +2101,23 @@ func handleSlashMove(s *discordgo.Session, i *discordgo.InteractionCreate, gs *g
 	}
 	moved, total, ok := gs.moveQueuedTrack(from, to)
 	if !ok {
-		_ = respondEphemeral(s, i, fmt.Sprintf("Could not move #%d to #%d. Queue size: %d.", from, to, total))
+		editInteractionContent(s, i, fmt.Sprintf("Could not move #%d to #%d. Queue size: %d.", from, to, total))
 		return
 	}
 	if from == to {
-		_ = respondEphemeral(s, i, fmt.Sprintf("#%d is already there: %s", from, formatQueueTrack(moved)))
+		editInteractionContent(s, i, fmt.Sprintf("#%d is already there: %s", from, formatQueueTrack(moved)))
 		return
 	}
-	_ = respondEphemeral(s, i, fmt.Sprintf("Moved #%d to #%d: %s", from, to, formatQueueTrack(moved)))
+	editInteractionContent(s, i, fmt.Sprintf("Moved #%d to #%d: %s", from, to, formatQueueTrack(moved)))
 }
 
 func handleSlashClear(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
 	n := gs.clearQueuedTracks()
 	if n == 0 {
-		_ = respondEphemeral(s, i, "Queue is already empty.")
+		editInteractionContent(s, i, "Queue is already empty.")
 		return
 	}
-	_ = respondEphemeral(s, i, fmt.Sprintf("Cleared %d queued %s.", n, pluralize(n, "track", "tracks")))
+	editInteractionContent(s, i, fmt.Sprintf("Cleared %d queued %s.", n, pluralize(n, "track", "tracks")))
 }
 
 func handleSlashQueue(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
@@ -2056,7 +2128,7 @@ func handleSlashQueue(s *discordgo.Session, i *discordgo.InteractionCreate, gs *
 			break
 		}
 	}
-	_ = respondQueueEmbed(s, i, gs, page)
+	editInteractionEmbeds(s, i, []*discordgo.MessageEmbed{buildQueueEmbed(gs, page)})
 }
 
 func handleSlashAutoplay(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
@@ -2070,13 +2142,13 @@ func handleSlashAutoplay(s *discordgo.Session, i *discordgo.InteractionCreate, g
 	}
 
 	enabled := setAutoplay(gs, requestedState)
-	_ = respondEphemeral(s, i, autoplayStatusMessage(enabled))
+	editInteractionContent(s, i, autoplayStatusMessage(enabled))
 }
 
 // handleSlashPlay handles the /play command: verifies the user is in a voice
 // channel, defers the response immediately (to avoid Discord's 3-second
-// timeout), then resolves and enqueues the track in a goroutine.
-func handleSlashPlay(s *discordgo.Session, i *discordgo.InteractionCreate) {
+// timeout), then resolves and enqueues the track through the per-guild action lane.
+func handleSlashPlay(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
 	uid := interactionUserID(i)
 	if uid == "" {
 		_ = respondEphemeral(s, i, "Could not identify your user.")
@@ -2105,25 +2177,19 @@ func handleSlashPlay(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	// Defer immediately so Discord does not time out during search/resolve.
-	if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-	}); err != nil {
+	if err := deferInteraction(s, i, false); err != nil {
 		log.Printf("slash defer: %v", err)
 		return
 	}
 
 	ch, guildID := i.ChannelID, i.GuildID
-	go func() {
+	enqueueDeferredAction(s, i, gs, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 		defer cancel()
 		msg := runPlayFlow(ctx, s, guildID, ch, voiceChID, query)
 		if msg == "" {
 			msg = "Queued — starting playback in your voice channel."
 		}
-		if _, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{Content: &msg}); err != nil {
-			log.Printf("slash edit: %v", err)
-			_, _ = s.ChannelMessageSend(ch, msg)
-		}
-	}()
+		editInteractionContent(s, i, msg)
+	})
 }
