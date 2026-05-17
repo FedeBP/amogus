@@ -576,7 +576,7 @@ func Start() {
 	session.Identify.Intents = discordgo.IntentsGuilds |
 		discordgo.IntentsGuildVoiceStates
 
-	session.AddHandler(botVoiceStateHandler)
+	session.AddHandler(voiceStateHandler)
 	session.AddHandler(interactionHandler)
 	session.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
 		// Overwrite all slash commands on startup so any definition changes
@@ -617,11 +617,14 @@ func voiceChannelForUser(s *discordgo.Session, guildID, userID string) (string, 
 	return "", errNotInVoice
 }
 
-// botVoiceStateHandler detects when the bot is removed from a voice channel
-// by an external actor and clears the guild queue accordingly.
-// It ignores disconnects that the bot itself initiates (intentionalLeave flag).
-func botVoiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
-	if vs == nil || vs.VoiceState == nil || vs.UserID != BotID || BotID == "" {
+// voiceStateHandler clears playback when the bot leaves voice or when its
+// current voice channel becomes empty.
+func voiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
+	if vs == nil || vs.VoiceState == nil || BotID == "" {
+		return
+	}
+	if vs.UserID != BotID {
+		maybeDisconnectEmptyVoiceChannel(s, vs.GuildID)
 		return
 	}
 	if vs.ChannelID != "" {
@@ -645,6 +648,103 @@ func botVoiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) 
 		if err := disconnectVoiceConnection(vc); err != nil {
 			log.Printf("voice cleanup after disconnect: %v", err)
 		}
+	}
+}
+
+func maybeDisconnectEmptyVoiceChannel(s *discordgo.Session, guildID string) {
+	channelID := botVoiceChannelID(s, guildID)
+	if channelID == "" || !voiceChannelIsEmpty(s, guildID, channelID) {
+		return
+	}
+
+	gs := getGuildState(guildID)
+	if !gs.enqueueAction(func() {
+		channelID := botVoiceChannelID(s, guildID)
+		if channelID == "" || !voiceChannelIsEmpty(s, guildID, channelID) {
+			return
+		}
+		disconnectEmptyVoiceChannel(s, guildID, gs, channelID)
+	}) {
+		log.Printf("empty voice disconnect skipped in guild %s: action queue is full", guildID)
+	}
+}
+
+func botVoiceChannelID(s *discordgo.Session, guildID string) string {
+	if s == nil {
+		return ""
+	}
+	s.RLock()
+	vc := s.VoiceConnections[guildID]
+	s.RUnlock()
+	if vc != nil {
+		vc.RLock()
+		channelID := vc.ChannelID
+		vc.RUnlock()
+		if channelID != "" {
+			return channelID
+		}
+	}
+
+	if s.State == nil {
+		return ""
+	}
+	g, err := s.State.Guild(guildID)
+	if err != nil {
+		return ""
+	}
+	for _, voiceState := range g.VoiceStates {
+		if voiceState.UserID == BotID {
+			return voiceState.ChannelID
+		}
+	}
+	return ""
+}
+
+func voiceChannelIsEmpty(s *discordgo.Session, guildID, channelID string) bool {
+	if s == nil || s.State == nil {
+		return false
+	}
+	g, err := s.State.Guild(guildID)
+	if err != nil {
+		log.Printf("empty voice check: %v", err)
+		return false
+	}
+	return !voiceChannelHasListeners(g, channelID)
+}
+
+func voiceChannelHasListeners(g *discordgo.Guild, channelID string) bool {
+	if g == nil || channelID == "" {
+		return false
+	}
+	for _, voiceState := range g.VoiceStates {
+		if voiceState.ChannelID == channelID && voiceState.UserID != BotID {
+			return true
+		}
+	}
+	return false
+}
+
+func disconnectEmptyVoiceChannel(s *discordgo.Session, guildID string, gs *guildState, channelID string) {
+	log.Printf("Voice channel %s in guild %s is empty; stopping playback.", channelID, guildID)
+	controls := gs.clearNowPlayingControlsFor("")
+	gs.resetPlaybackState()
+	clearNowPlayingMessageComponents(s, controls)
+
+	s.RLock()
+	vc := s.VoiceConnections[guildID]
+	s.RUnlock()
+	if vc == nil {
+		return
+	}
+	vc.RLock()
+	currentChannelID := vc.ChannelID
+	vc.RUnlock()
+	if currentChannelID != "" && currentChannelID != channelID {
+		return
+	}
+	gs.intentionalLeave.Store(true)
+	if err := disconnectVoiceConnection(vc); err != nil {
+		log.Printf("empty voice disconnect: %v", err)
 	}
 }
 

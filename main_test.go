@@ -141,6 +141,48 @@ func TestActivateNowPlayingControlsReturnsPreviousMessage(t *testing.T) {
 	}
 }
 
+func TestVoiceChannelHasListenersIgnoresOnlyBot(t *testing.T) {
+	oldBotID := BotID
+	BotID = "bot"
+	t.Cleanup(func() { BotID = oldBotID })
+
+	g := &discordgo.Guild{
+		VoiceStates: []*discordgo.VoiceState{
+			{UserID: "bot", ChannelID: "voice"},
+		},
+	}
+
+	if voiceChannelHasListeners(g, "voice") {
+		t.Fatal("voiceChannelHasListeners() = true, want false when only the bot remains")
+	}
+
+	g.VoiceStates = append(g.VoiceStates, &discordgo.VoiceState{UserID: "listener", ChannelID: "voice"})
+	if !voiceChannelHasListeners(g, "voice") {
+		t.Fatal("voiceChannelHasListeners() = false, want true with another user present")
+	}
+}
+
+func TestBotVoiceChannelIDFallsBackToState(t *testing.T) {
+	oldBotID := BotID
+	BotID = "bot"
+	t.Cleanup(func() { BotID = oldBotID })
+
+	state := discordgo.NewState()
+	if err := state.GuildAdd(&discordgo.Guild{
+		ID: "guild",
+		VoiceStates: []*discordgo.VoiceState{
+			{UserID: "bot", ChannelID: "voice"},
+		},
+	}); err != nil {
+		t.Fatalf("GuildAdd() error = %v", err)
+	}
+	s := &discordgo.Session{State: state}
+
+	if got := botVoiceChannelID(s, "guild"); got != "voice" {
+		t.Fatalf("botVoiceChannelID() = %q, want voice", got)
+	}
+}
+
 func TestSetAutoplayTogglesAndAppliesExplicitState(t *testing.T) {
 	gs := &guildState{}
 
