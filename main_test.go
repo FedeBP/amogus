@@ -53,9 +53,9 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	}
 }
 
-func TestIdleDisconnectTimeoutIsTenMinutes(t *testing.T) {
-	if idleDisconnectTimeout != 10*time.Minute {
-		t.Fatalf("idleDisconnectTimeout = %s, want 10m0s", idleDisconnectTimeout)
+func TestIdleDisconnectTimeoutIsFiveMinutes(t *testing.T) {
+	if idleDisconnectTimeout != 5*time.Minute {
+		t.Fatalf("idleDisconnectTimeout = %s, want 5m0s", idleDisconnectTimeout)
 	}
 }
 

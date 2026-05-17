@@ -45,7 +45,7 @@ When autoplay is enabled and the queue runs out, the bot asks the YouTube Music 
 
 - The bot should not auto-rejoin when someone disconnects it from voice.
 - If the bot is kicked from voice, playback state and autoplay are cleared.
-- After playback ends, the bot disconnects after 10 minutes of inactivity.
+- After playback ends, the bot disconnects after 5 minutes of inactivity.
 - Search, autocomplete, and autoplay suggestions require the local Python sidecar.
 
 ## Operator Setup

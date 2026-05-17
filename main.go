@@ -305,7 +305,7 @@ const (
 	queuePageSize          = 10
 	queueLineMaxLen        = 120
 	discordFieldValueMax   = 1024
-	idleDisconnectTimeout  = 10 * time.Minute
+	idleDisconnectTimeout  = 5 * time.Minute
 	opusSendTimeout        = 2 * time.Second
 	opusSendPollInterval   = 20 * time.Millisecond
 )
