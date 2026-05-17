@@ -235,6 +235,34 @@ func TestStopAfterAutoplayErrorStopsEmptyLoop(t *testing.T) {
 	}
 }
 
+func TestDisableAutoplayAfterPlaybackError(t *testing.T) {
+	gs := &guildState{autoplayEnabled: true}
+	generation := gs.playbackGeneration.Load()
+
+	if !gs.disableAutoplayAfterPlaybackError(generation) {
+		t.Fatal("disableAutoplayAfterPlaybackError() = false, want true")
+	}
+	if gs.autoplayEnabled {
+		t.Fatal("autoplayEnabled = true, want false")
+	}
+	if gs.disableAutoplayAfterPlaybackError(generation) {
+		t.Fatal("second disableAutoplayAfterPlaybackError() = true, want false")
+	}
+}
+
+func TestDisableAutoplayAfterPlaybackErrorIgnoresStaleGeneration(t *testing.T) {
+	gs := &guildState{autoplayEnabled: true}
+	generation := gs.playbackGeneration.Load()
+	gs.playbackGeneration.Add(1)
+
+	if gs.disableAutoplayAfterPlaybackError(generation) {
+		t.Fatal("disableAutoplayAfterPlaybackError() = true, want false for stale generation")
+	}
+	if !gs.autoplayEnabled {
+		t.Fatal("autoplayEnabled = false, want true for stale generation")
+	}
+}
+
 func TestSendOpusPacketReturnsWhenSkipIsRequested(t *testing.T) {
 	gs := &guildState{}
 	gs.skipInterrupt.Store(true)

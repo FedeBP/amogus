@@ -201,6 +201,17 @@ func (gs *guildState) stopAfterAutoplayError(generation uint64) bool {
 	return true
 }
 
+func (gs *guildState) disableAutoplayAfterPlaybackError(generation uint64) bool {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if gs.playbackGeneration.Load() != generation {
+		return false
+	}
+	wasEnabled := gs.autoplayEnabled
+	gs.autoplayEnabled = false
+	return wasEnabled
+}
+
 type autoplaySkipRequest struct {
 	seed           Track
 	voiceChannelID string
@@ -1244,7 +1255,11 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 				_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
 			} else {
 				log.Printf("stream: %v", err)
-				_, _ = s.ChannelMessageSend(textChannelID, "Playback error; skipping to next track.")
+				msg := "Playback error; skipping to next track."
+				if gs.disableAutoplayAfterPlaybackError(generation) {
+					msg = "Playback error; autoplay disabled to avoid a retry loop. Skipping to next track."
+				}
+				_, _ = s.ChannelMessageSend(textChannelID, msg)
 			}
 		} else if gs.skipInterrupt.Load() {
 			if gs.playbackGeneration.Load() != generation {
