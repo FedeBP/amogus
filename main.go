@@ -136,18 +136,22 @@ type guildAction func()
 // guildState holds all mutable playback state for one Discord server.
 // Keeping state per-guild ensures that multiple servers never interfere.
 type guildState struct {
-	mu                 sync.Mutex
-	actionQueue        chan guildAction
-	songQueue          []Song
-	isPlaying          bool
-	autoplayEnabled    bool
-	lastPlayed         Track
-	lastVoiceChannelID string
-	recentVideoIDs     []string
-	recentTracks       []Track
-	disconnectTimer    *time.Timer
-	activeDlCmd        *exec.Cmd
-	activeFfCmd        *exec.Cmd
+	mu                   sync.Mutex
+	actionQueue          chan guildAction
+	songQueue            []Song
+	isPlaying            bool
+	autoplayEnabled      bool
+	lastPlayed           Track
+	lastVoiceChannelID   string
+	recentVideoIDs       []string
+	recentTracks         []Track
+	disconnectTimer      *time.Timer
+	activeDlCmd          *exec.Cmd
+	activeFfCmd          *exec.Cmd
+	nowPlayingChannelID  string
+	nowPlayingMessageID  string
+	nowPlayingControlID  string
+	nowPlayingControlSeq uint64
 	// skipInterrupt is set to true by /skip to signal streamAudio to halt.
 	skipInterrupt      atomic.Bool
 	playbackGeneration atomic.Uint64
@@ -242,6 +246,80 @@ func (gs *guildState) enqueueAction(action guildAction) bool {
 	}
 }
 
+type nowPlayingMessageRef struct {
+	channelID string
+	messageID string
+}
+
+func (gs *guildState) activateNowPlayingControls(channelID string) (string, nowPlayingMessageRef) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+
+	previous := nowPlayingMessageRef{
+		channelID: gs.nowPlayingChannelID,
+		messageID: gs.nowPlayingMessageID,
+	}
+	gs.nowPlayingControlSeq++
+	controlID := fmt.Sprintf("%d", gs.nowPlayingControlSeq)
+	gs.nowPlayingChannelID = channelID
+	gs.nowPlayingMessageID = ""
+	gs.nowPlayingControlID = controlID
+	return controlID, previous
+}
+
+func (gs *guildState) confirmNowPlayingMessage(controlID, messageID string) {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if gs.nowPlayingControlID != controlID {
+		return
+	}
+	gs.nowPlayingMessageID = messageID
+}
+
+func (gs *guildState) clearNowPlayingControlsFor(controlID string) nowPlayingMessageRef {
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	if controlID != "" && gs.nowPlayingControlID != controlID {
+		return nowPlayingMessageRef{}
+	}
+	return gs.clearNowPlayingControlsLocked()
+}
+
+func (gs *guildState) clearNowPlayingControlsLocked() nowPlayingMessageRef {
+	previous := nowPlayingMessageRef{
+		channelID: gs.nowPlayingChannelID,
+		messageID: gs.nowPlayingMessageID,
+	}
+	gs.nowPlayingChannelID = ""
+	gs.nowPlayingMessageID = ""
+	gs.nowPlayingControlID = ""
+	return previous
+}
+
+func (gs *guildState) activeNowPlayingAction(customID string) (string, bool) {
+	action, controlID, ok := parseNowPlayingCustomID(customID)
+	if !ok {
+		return "", false
+	}
+	gs.mu.Lock()
+	defer gs.mu.Unlock()
+	return action, controlID != "" && controlID == gs.nowPlayingControlID
+}
+
+func parseNowPlayingCustomID(customID string) (string, string, bool) {
+	i := strings.LastIndex(customID, ":")
+	if i <= 0 || i == len(customID)-1 {
+		return "", "", false
+	}
+	action := customID[:i]
+	switch action {
+	case nowPlayingButtonSkip, nowPlayingButtonStop, nowPlayingButtonQueue, nowPlayingButtonAutoplay:
+		return action, customID[i+1:], true
+	default:
+		return "", "", false
+	}
+}
+
 type autoplaySkipRequest struct {
 	seed           Track
 	voiceChannelID string
@@ -298,6 +376,7 @@ func (gs *guildState) resetPlaybackState() {
 	gs.lastVoiceChannelID = ""
 	gs.recentVideoIDs = nil
 	gs.recentTracks = nil
+	gs.clearNowPlayingControlsLocked()
 	if gs.disconnectTimer != nil {
 		gs.disconnectTimer.Stop()
 		gs.disconnectTimer = nil
@@ -1200,7 +1279,9 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 			canAutoplay := gs.autoplayEnabled && trackVideoID(seed) != "" && voiceChannelID != ""
 			if !canAutoplay {
 				gs.isPlaying = false
+				controls := gs.clearNowPlayingControlsLocked()
 				gs.mu.Unlock()
+				clearNowPlayingMessageComponents(s, controls)
 				return
 			}
 			excluded := gs.autoplayExclusionsLocked()
@@ -1274,7 +1355,7 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 			return
 		}
 
-		sendNowPlayingEmbed(s, textChannelID, song.track)
+		sendNowPlayingEmbed(s, gs, textChannelID, song.track)
 
 		err = streamAudio(gs, vc, dl, song.track.URL, generation)
 		if err != nil {
@@ -1321,11 +1402,35 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 
 // sendNowPlayingEmbed posts a "Now Playing" embed to the text channel.
 // If the track has no metadata (direct URL, no search), only the URL is shown.
-func sendNowPlayingEmbed(s *discordgo.Session, textChannelID string, t Track) {
-	_, _ = s.ChannelMessageSendComplex(textChannelID, &discordgo.MessageSend{
+func sendNowPlayingEmbed(s *discordgo.Session, gs *guildState, textChannelID string, t Track) {
+	controlID, previous := gs.activateNowPlayingControls(textChannelID)
+	clearNowPlayingMessageComponents(s, previous)
+
+	msg, err := s.ChannelMessageSendComplex(textChannelID, &discordgo.MessageSend{
 		Embeds:     []*discordgo.MessageEmbed{buildNowPlayingEmbed(t)},
-		Components: buildNowPlayingComponents(),
+		Components: buildNowPlayingComponents(controlID),
 	})
+	if err != nil {
+		log.Printf("now playing send: %v", err)
+		controls := gs.clearNowPlayingControlsFor(controlID)
+		clearNowPlayingMessageComponents(s, controls)
+		return
+	}
+	gs.confirmNowPlayingMessage(controlID, msg.ID)
+}
+
+func clearNowPlayingMessageComponents(s *discordgo.Session, ref nowPlayingMessageRef) {
+	if ref.channelID == "" || ref.messageID == "" {
+		return
+	}
+	components := []discordgo.MessageComponent{}
+	if _, err := s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		ID:         ref.messageID,
+		Channel:    ref.channelID,
+		Components: &components,
+	}); err != nil {
+		log.Printf("clear now playing controls: %v", err)
+	}
 }
 
 func buildNowPlayingEmbed(t Track) *discordgo.MessageEmbed {
@@ -1346,33 +1451,37 @@ func buildNowPlayingEmbed(t Track) *discordgo.MessageEmbed {
 	}
 }
 
-func buildNowPlayingComponents() []discordgo.MessageComponent {
+func buildNowPlayingComponents(controlID string) []discordgo.MessageComponent {
 	return []discordgo.MessageComponent{
 		discordgo.ActionsRow{
 			Components: []discordgo.MessageComponent{
 				discordgo.Button{
 					Label:    "Skip",
 					Style:    discordgo.PrimaryButton,
-					CustomID: nowPlayingButtonSkip,
+					CustomID: nowPlayingCustomID(nowPlayingButtonSkip, controlID),
 				},
 				discordgo.Button{
 					Label:    "Stop",
 					Style:    discordgo.DangerButton,
-					CustomID: nowPlayingButtonStop,
+					CustomID: nowPlayingCustomID(nowPlayingButtonStop, controlID),
 				},
 				discordgo.Button{
 					Label:    "Queue",
 					Style:    discordgo.SecondaryButton,
-					CustomID: nowPlayingButtonQueue,
+					CustomID: nowPlayingCustomID(nowPlayingButtonQueue, controlID),
 				},
 				discordgo.Button{
 					Label:    "Autoplay",
 					Style:    discordgo.SecondaryButton,
-					CustomID: nowPlayingButtonAutoplay,
+					CustomID: nowPlayingCustomID(nowPlayingButtonAutoplay, controlID),
 				},
 			},
 		},
 	}
+}
+
+func nowPlayingCustomID(action, controlID string) string {
+	return action + ":" + controlID
 }
 
 type queueSnapshot struct {
@@ -1894,7 +2003,9 @@ func editInteractionEmbeds(s *discordgo.Session, i *discordgo.InteractionCreate,
 }
 
 func stopPlayback(s *discordgo.Session, guildID string, gs *guildState) {
+	controls := gs.clearNowPlayingControlsFor("")
 	gs.resetPlaybackState()
+	clearNowPlayingMessageComponents(s, controls)
 	s.RLock()
 	vc, ok := s.VoiceConnections[guildID]
 	s.RUnlock()
@@ -2039,7 +2150,12 @@ func handleQueuedSlashCommand(s *discordgo.Session, i *discordgo.InteractionCrea
 }
 
 func handleNowPlayingButton(s *discordgo.Session, i *discordgo.InteractionCreate, gs *guildState) {
-	switch i.MessageComponentData().CustomID {
+	action, ok := gs.activeNowPlayingAction(i.MessageComponentData().CustomID)
+	if !ok {
+		editInteractionContent(s, i, "That Now Playing message is no longer active.")
+		return
+	}
+	switch action {
 	case nowPlayingButtonSkip:
 		editInteractionContent(s, i, skipPlayback(s, i.GuildID, i.ChannelID, gs))
 	case nowPlayingButtonStop:

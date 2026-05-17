@@ -22,7 +22,11 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 		recentTracks: []Track{
 			{URL: "https://www.youtube.com/watch?v=abc123", Title: "Victory Lap Five", Artist: "Fred again.."},
 		},
-		disconnectTimer: time.AfterFunc(time.Hour, func() {}),
+		disconnectTimer:      time.AfterFunc(time.Hour, func() {}),
+		nowPlayingChannelID:  "text",
+		nowPlayingMessageID:  "message",
+		nowPlayingControlID:  "control",
+		nowPlayingControlSeq: 10,
 	}
 
 	gs.resetPlaybackState()
@@ -51,6 +55,9 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	if gs.disconnectTimer != nil {
 		t.Fatal("disconnectTimer was not cleared")
 	}
+	if gs.nowPlayingChannelID != "" || gs.nowPlayingMessageID != "" || gs.nowPlayingControlID != "" {
+		t.Fatalf("now playing controls = %q/%q/%q, want cleared", gs.nowPlayingChannelID, gs.nowPlayingMessageID, gs.nowPlayingControlID)
+	}
 }
 
 func TestIdleDisconnectTimeoutIsFiveMinutes(t *testing.T) {
@@ -60,7 +67,7 @@ func TestIdleDisconnectTimeoutIsFiveMinutes(t *testing.T) {
 }
 
 func TestBuildNowPlayingComponentsAddsControlButtons(t *testing.T) {
-	components := buildNowPlayingComponents()
+	components := buildNowPlayingComponents("42")
 	if len(components) != 1 {
 		t.Fatalf("components length = %d, want 1", len(components))
 	}
@@ -74,10 +81,10 @@ func TestBuildNowPlayingComponentsAddsControlButtons(t *testing.T) {
 		customID string
 		style    discordgo.ButtonStyle
 	}{
-		{label: "Skip", customID: nowPlayingButtonSkip, style: discordgo.PrimaryButton},
-		{label: "Stop", customID: nowPlayingButtonStop, style: discordgo.DangerButton},
-		{label: "Queue", customID: nowPlayingButtonQueue, style: discordgo.SecondaryButton},
-		{label: "Autoplay", customID: nowPlayingButtonAutoplay, style: discordgo.SecondaryButton},
+		{label: "Skip", customID: nowPlayingCustomID(nowPlayingButtonSkip, "42"), style: discordgo.PrimaryButton},
+		{label: "Stop", customID: nowPlayingCustomID(nowPlayingButtonStop, "42"), style: discordgo.DangerButton},
+		{label: "Queue", customID: nowPlayingCustomID(nowPlayingButtonQueue, "42"), style: discordgo.SecondaryButton},
+		{label: "Autoplay", customID: nowPlayingCustomID(nowPlayingButtonAutoplay, "42"), style: discordgo.SecondaryButton},
 	}
 
 	if len(row.Components) != len(expected) {
@@ -91,6 +98,46 @@ func TestBuildNowPlayingComponentsAddsControlButtons(t *testing.T) {
 		if button.Label != want.label || button.CustomID != want.customID || button.Style != want.style {
 			t.Fatalf("button %d = %#v, want label=%q customID=%q style=%d", i, button, want.label, want.customID, want.style)
 		}
+	}
+}
+
+func TestActiveNowPlayingActionRejectsStaleControls(t *testing.T) {
+	gs := &guildState{nowPlayingControlID: "current"}
+
+	action, ok := gs.activeNowPlayingAction(nowPlayingCustomID(nowPlayingButtonSkip, "current"))
+	if !ok {
+		t.Fatal("activeNowPlayingAction() ok = false, want true")
+	}
+	if action != nowPlayingButtonSkip {
+		t.Fatalf("activeNowPlayingAction() action = %q, want %q", action, nowPlayingButtonSkip)
+	}
+
+	if _, ok := gs.activeNowPlayingAction(nowPlayingCustomID(nowPlayingButtonSkip, "old")); ok {
+		t.Fatal("activeNowPlayingAction() ok = true, want false for stale control")
+	}
+	if _, ok := gs.activeNowPlayingAction(nowPlayingButtonSkip); ok {
+		t.Fatal("activeNowPlayingAction() ok = true, want false for legacy unscoped control")
+	}
+}
+
+func TestActivateNowPlayingControlsReturnsPreviousMessage(t *testing.T) {
+	gs := &guildState{
+		nowPlayingChannelID:  "old-channel",
+		nowPlayingMessageID:  "old-message",
+		nowPlayingControlID:  "old-control",
+		nowPlayingControlSeq: 7,
+	}
+
+	controlID, previous := gs.activateNowPlayingControls("new-channel")
+
+	if controlID != "8" {
+		t.Fatalf("controlID = %q, want 8", controlID)
+	}
+	if previous.channelID != "old-channel" || previous.messageID != "old-message" {
+		t.Fatalf("previous = %#v, want old-channel/old-message", previous)
+	}
+	if gs.nowPlayingChannelID != "new-channel" || gs.nowPlayingMessageID != "" || gs.nowPlayingControlID != "8" {
+		t.Fatalf("active controls = %q/%q/%q, want new-channel//8", gs.nowPlayingChannelID, gs.nowPlayingMessageID, gs.nowPlayingControlID)
 	}
 }
 

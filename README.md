@@ -26,7 +26,7 @@ The bot searches YouTube Music for normal text queries. It also accepts direct Y
 | `/clear` | Clears upcoming tracks without stopping the current song. |
 | `/autoplay [enabled]` | Toggles autoplay, or sets it with `enabled:true` / `enabled:false`. |
 
-Now Playing messages also include buttons for skip, stop, queue, and autoplay.
+The latest Now Playing message includes buttons for skip, stop, queue, and autoplay; older Now Playing messages have their controls removed.
 
 ## Autoplay
 
