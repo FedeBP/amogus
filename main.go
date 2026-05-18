@@ -449,6 +449,9 @@ const (
 	discordFieldValueMax   = 1024
 	guildActionQueueSize   = 64
 	defaultMaxStreams      = 5
+	searchCacheMaxEntries  = 256
+	trackCacheMaxEntries   = 2048
+	searchCacheTTL         = 10 * time.Minute
 	idleDisconnectTimeout  = 5 * time.Minute
 	opusSendTimeout        = 2 * time.Second
 	opusSendPollInterval   = 20 * time.Millisecond
@@ -1141,6 +1144,8 @@ func ytDownloaderPath() (string, error) {
 // ---------------------------------------------------------------------------
 
 func cacheTrackMetadataLocked(results []SearchResult, expires time.Time) {
+	now := time.Now()
+	pruneExpiredTrackMetadataLocked(now)
 	for _, r := range results {
 		if r.VideoID == "" {
 			continue
@@ -1150,17 +1155,92 @@ func cacheTrackMetadataLocked(results []SearchResult, expires time.Time) {
 			expires: expires,
 		}
 	}
+	trimTrackMetadataCacheLocked(trackCacheMaxEntries)
+}
+
+func cachedSearchResultsLocked(query string, now time.Time) ([]SearchResult, bool) {
+	cached, ok := searchCache[query]
+	if !ok {
+		return nil, false
+	}
+	if !now.Before(cached.expires) {
+		delete(searchCache, query)
+		return nil, false
+	}
+	return cached.results, true
+}
+
+func cacheSearchResultsLocked(query string, results []SearchResult, expires time.Time) {
+	now := time.Now()
+	pruneExpiredSearchCacheLocked(now)
+	searchCache[query] = cachedSearch{
+		results: results,
+		expires: expires,
+	}
+	trimSearchCacheLocked(searchCacheMaxEntries)
+}
+
+func pruneExpiredSearchCacheLocked(now time.Time) {
+	for query, cached := range searchCache {
+		if !now.Before(cached.expires) {
+			delete(searchCache, query)
+		}
+	}
+}
+
+func pruneExpiredTrackMetadataLocked(now time.Time) {
+	for videoID, cached := range trackMetadataCache {
+		if !now.Before(cached.expires) {
+			delete(trackMetadataCache, videoID)
+		}
+	}
+}
+
+func trimSearchCacheLocked(maxEntries int) {
+	for len(searchCache) > maxEntries {
+		var oldestKey string
+		var oldestExpires time.Time
+		for query, cached := range searchCache {
+			if oldestKey == "" || cached.expires.Before(oldestExpires) {
+				oldestKey = query
+				oldestExpires = cached.expires
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(searchCache, oldestKey)
+	}
+}
+
+func trimTrackMetadataCacheLocked(maxEntries int) {
+	for len(trackMetadataCache) > maxEntries {
+		var oldestKey string
+		var oldestExpires time.Time
+		for videoID, cached := range trackMetadataCache {
+			if oldestKey == "" || cached.expires.Before(oldestExpires) {
+				oldestKey = videoID
+				oldestExpires = cached.expires
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(trackMetadataCache, oldestKey)
+	}
 }
 
 func cachedTrackByVideoID(videoID string) (Track, bool) {
 	searchCacheMu.Lock()
 	defer searchCacheMu.Unlock()
 
+	now := time.Now()
+	pruneExpiredTrackMetadataLocked(now)
 	cached, ok := trackMetadataCache[videoID]
 	if !ok {
 		return Track{}, false
 	}
-	if time.Now().After(cached.expires) {
+	if !now.Before(cached.expires) {
 		delete(trackMetadataCache, videoID)
 		return Track{}, false
 	}
@@ -1201,10 +1281,11 @@ func resolveTrack(ctx context.Context, query string) (Track, error) {
 // Results are cached for 10 minutes, so rapid autocomplete keystrokes do not
 // hammer the sidecar with duplicate requests.
 func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
+	now := time.Now()
 	searchCacheMu.Lock()
-	if cached, ok := searchCache[query]; ok && time.Now().Before(cached.expires) {
+	if cached, ok := cachedSearchResultsLocked(query, now); ok {
 		searchCacheMu.Unlock()
-		return cached.results, nil
+		return cached, nil
 	}
 	searchCacheMu.Unlock()
 
@@ -1228,12 +1309,9 @@ func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 		return nil, err
 	}
 
-	expires := time.Now().Add(10 * time.Minute)
+	expires := time.Now().Add(searchCacheTTL)
 	searchCacheMu.Lock()
-	searchCache[query] = cachedSearch{
-		results: results,
-		expires: expires,
-	}
+	cacheSearchResultsLocked(query, results, expires)
 	cacheTrackMetadataLocked(results, expires)
 	searchCacheMu.Unlock()
 
@@ -1272,7 +1350,7 @@ func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResul
 		return nil, err
 	}
 	searchCacheMu.Lock()
-	cacheTrackMetadataLocked(results, time.Now().Add(10*time.Minute))
+	cacheTrackMetadataLocked(results, time.Now().Add(searchCacheTTL))
 	searchCacheMu.Unlock()
 	return results, nil
 }

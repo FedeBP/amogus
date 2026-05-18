@@ -435,6 +435,118 @@ func TestProcessOutputTailLabelsTrimmedTail(t *testing.T) {
 	}
 }
 
+func resetSearchCachesForTest(t *testing.T) {
+	t.Helper()
+
+	searchCacheMu.Lock()
+	oldSearchCache := searchCache
+	oldTrackMetadataCache := trackMetadataCache
+	searchCache = map[string]cachedSearch{}
+	trackMetadataCache = map[string]cachedTrackMetadata{}
+	searchCacheMu.Unlock()
+
+	t.Cleanup(func() {
+		searchCacheMu.Lock()
+		searchCache = oldSearchCache
+		trackMetadataCache = oldTrackMetadataCache
+		searchCacheMu.Unlock()
+	})
+}
+
+func TestSearchCachePrunesExpiredEntriesOnInsert(t *testing.T) {
+	resetSearchCachesForTest(t)
+
+	now := time.Now()
+	searchCacheMu.Lock()
+	searchCache["expired"] = cachedSearch{
+		results: []SearchResult{{VideoID: "expired"}},
+		expires: now.Add(-time.Second),
+	}
+	cacheSearchResultsLocked("fresh", []SearchResult{{VideoID: "fresh"}}, now.Add(time.Hour))
+	_, expiredExists := searchCache["expired"]
+	_, freshExists := searchCache["fresh"]
+	searchCacheMu.Unlock()
+
+	if expiredExists {
+		t.Fatal("expired search cache entry was not pruned")
+	}
+	if !freshExists {
+		t.Fatal("fresh search cache entry was not stored")
+	}
+}
+
+func TestSearchCacheTrimsOldestEntries(t *testing.T) {
+	resetSearchCachesForTest(t)
+
+	base := time.Now().Add(time.Hour)
+	searchCacheMu.Lock()
+	for i := 0; i <= searchCacheMaxEntries; i++ {
+		query := fmt.Sprintf("query-%03d", i)
+		cacheSearchResultsLocked(query, []SearchResult{{VideoID: query}}, base.Add(time.Duration(i)*time.Second))
+	}
+	_, oldestExists := searchCache["query-000"]
+	_, newestExists := searchCache[fmt.Sprintf("query-%03d", searchCacheMaxEntries)]
+	gotLen := len(searchCache)
+	searchCacheMu.Unlock()
+
+	if gotLen != searchCacheMaxEntries {
+		t.Fatalf("search cache length = %d, want %d", gotLen, searchCacheMaxEntries)
+	}
+	if oldestExists {
+		t.Fatal("oldest search cache entry was not evicted")
+	}
+	if !newestExists {
+		t.Fatal("newest search cache entry was evicted")
+	}
+}
+
+func TestTrackMetadataCachePrunesExpiredEntriesOnInsert(t *testing.T) {
+	resetSearchCachesForTest(t)
+
+	now := time.Now()
+	searchCacheMu.Lock()
+	trackMetadataCache["expired"] = cachedTrackMetadata{
+		track:   Track{URL: "https://www.youtube.com/watch?v=expired"},
+		expires: now.Add(-time.Second),
+	}
+	cacheTrackMetadataLocked([]SearchResult{{VideoID: "fresh", Title: "Fresh"}}, now.Add(time.Hour))
+	_, expiredExists := trackMetadataCache["expired"]
+	_, freshExists := trackMetadataCache["fresh"]
+	searchCacheMu.Unlock()
+
+	if expiredExists {
+		t.Fatal("expired track metadata cache entry was not pruned")
+	}
+	if !freshExists {
+		t.Fatal("fresh track metadata cache entry was not stored")
+	}
+}
+
+func TestTrackMetadataCacheTrimsOldestEntries(t *testing.T) {
+	resetSearchCachesForTest(t)
+
+	base := time.Now().Add(time.Hour)
+	searchCacheMu.Lock()
+	for i := 0; i <= trackCacheMaxEntries; i++ {
+		videoID := fmt.Sprintf("video-%04d", i)
+		cacheTrackMetadataLocked([]SearchResult{{VideoID: videoID, Title: videoID}}, base.Add(time.Duration(i)*time.Second))
+	}
+	_, oldestExists := trackMetadataCache["video-0000"]
+	_, newestExists := trackMetadataCache[fmt.Sprintf("video-%04d", trackCacheMaxEntries)]
+	gotLen := len(trackMetadataCache)
+	searchCacheMu.Unlock()
+
+	if gotLen != trackCacheMaxEntries {
+		t.Fatalf("track metadata cache length = %d, want %d", gotLen, trackCacheMaxEntries)
+	}
+	if oldestExists {
+		t.Fatal("oldest track metadata cache entry was not evicted")
+	}
+	if !newestExists {
+		t.Fatal("newest track metadata cache entry was evicted")
+	}
+}
+
 func TestStopAfterAutoplayErrorKeepsLoopAliveForQueuedTrack(t *testing.T) {
 	gs := &guildState{
 		songQueue: []Song{
