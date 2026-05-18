@@ -2061,55 +2061,77 @@ type oggPage struct {
 	packets     [][]byte // reassembled lacing packets on this page
 }
 
+type oggReader struct {
+	header      [27]byte
+	segTable    [255]byte
+	packetSizes [255]int
+	packets     [255][]byte
+	packetSlots int
+	page        oggPage
+}
+
 // readOggPage reads and parses the next OGG page from r.
 func readOggPage(r io.Reader) (*oggPage, error) {
+	var reader oggReader
+	return reader.readPage(r)
+}
+
+// readPage reads and parses the next OGG page from r, reusing parser scratch
+// buffers across calls. Packet byte slices are still newly allocated because
+// vc.OpusSend consumes them asynchronously.
+func (or *oggReader) readPage(r io.Reader) (*oggPage, error) {
 	// Fixed 27-byte header.
-	var header [27]byte
+	header := or.header[:]
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, err
 	}
-	if string(header[0:4]) != oggCapturePattern {
+	if header[0] != 'O' || header[1] != 'g' || header[2] != 'g' || header[3] != 'S' {
 		return nil, fmt.Errorf("ogg: bad capture pattern %q", header[0:4])
 	}
 
-	page := &oggPage{
-		headerType:  header[5],
-		granulePos:  binary.LittleEndian.Uint64(header[6:14]),
-		sequenceNum: binary.LittleEndian.Uint32(header[18:22]),
+	page := &or.page
+	page.headerType = header[5]
+	page.granulePos = binary.LittleEndian.Uint64(header[6:14])
+	page.sequenceNum = binary.LittleEndian.Uint32(header[18:22])
+	for i := 0; i < or.packetSlots; i++ {
+		or.packets[i] = nil
 	}
+	page.packets = or.packets[:0]
+	or.packetSlots = 0
 
 	nSegs := int(header[26])
-	segTable := make([]byte, nSegs)
+	segTable := or.segTable[:nSegs]
 	if _, err := io.ReadFull(r, segTable); err != nil {
 		return nil, fmt.Errorf("ogg: reading segment table: %w", err)
 	}
 
-	// Read the page body as one contiguous slice, then split into packets
-	// using the lacing values.  A segment of 255 bytes means the packet
-	// continues in the next segment; anything shorter terminates it.
-	bodyLen := 0
+	// The lacing table tells us each packet's size before we read the page body.
+	// Reading packet-sized chunks avoids allocating a whole-page body and then
+	// copying each packet out of it.
+	packetCount := 0
+	packetLen := 0
 	for _, s := range segTable {
-		bodyLen += int(s)
-	}
-	body := make([]byte, bodyLen)
-	if _, err := io.ReadFull(r, body); err != nil {
-		return nil, fmt.Errorf("ogg: reading page body: %w", err)
-	}
-
-	offset := 0
-	var pkt []byte
-	for _, s := range segTable {
-		pkt = append(pkt, body[offset:offset+int(s)]...)
-		offset += int(s)
+		packetLen += int(s)
 		if s < 255 { // last segment of this packet
-			page.packets = append(page.packets, pkt)
-			pkt = nil
+			or.packetSizes[packetCount] = packetLen
+			packetCount++
+			packetLen = 0
 		}
 	}
-	if len(pkt) > 0 {
+	if packetLen > 0 {
 		// Continued packet with no terminator on this page (rare).
+		or.packetSizes[packetCount] = packetLen
+		packetCount++
+	}
+
+	for i := 0; i < packetCount; i++ {
+		pkt := make([]byte, or.packetSizes[i])
+		if _, err := io.ReadFull(r, pkt); err != nil {
+			return nil, fmt.Errorf("ogg: reading page body: %w", err)
+		}
 		page.packets = append(page.packets, pkt)
 	}
+	or.packetSlots = packetCount
 
 	return page, nil
 }
@@ -2293,13 +2315,15 @@ func streamAudioPipeline(gs *guildState, vc *discordgo.VoiceConnection, dl, yout
 		gs.mu.Unlock()
 	}()
 
+	var ogg oggReader
+
 	// Skip the two mandatory Opus header pages (identification + comment).
 	// pageIndex 0 = OpusHead, pageIndex 1 = OpusTags.
 	for skip := 0; skip < 2; skip++ {
 		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 			break
 		}
-		if _, err := readOggPage(ffStdout); err != nil {
+		if _, err := ogg.readPage(ffStdout); err != nil {
 			if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 				break
 			}
@@ -2317,7 +2341,7 @@ func streamAudioPipeline(gs *guildState, vc *discordgo.VoiceConnection, dl, yout
 			break
 		}
 
-		page, err := readOggPage(ffStdout)
+		page, err := ogg.readPage(ffStdout)
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break // normal end of stream

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"strings"
 	"testing"
@@ -406,6 +408,56 @@ func TestYtdlpCommandArgsDisableProgress(t *testing.T) {
 	}
 }
 
+func TestOggReaderReadsPackets(t *testing.T) {
+	largePacket := bytes.Repeat([]byte{0x7f}, 300)
+	pageData := testOggPage(t, 7, [][]byte{
+		[]byte("alpha"),
+		largePacket,
+		[]byte("omega"),
+	})
+
+	var reader oggReader
+	page, err := reader.readPage(bytes.NewReader(pageData))
+	if err != nil {
+		t.Fatalf("readPage() error = %v", err)
+	}
+	if page.sequenceNum != 7 {
+		t.Fatalf("sequenceNum = %d, want 7", page.sequenceNum)
+	}
+	if len(page.packets) != 3 {
+		t.Fatalf("packets = %d, want 3", len(page.packets))
+	}
+	if got := string(page.packets[0]); got != "alpha" {
+		t.Fatalf("packet 0 = %q, want alpha", got)
+	}
+	if !bytes.Equal(page.packets[1], largePacket) {
+		t.Fatalf("packet 1 did not round trip")
+	}
+	if got := string(page.packets[2]); got != "omega" {
+		t.Fatalf("packet 2 = %q, want omega", got)
+	}
+}
+
+func BenchmarkOggReaderReadPage(b *testing.B) {
+	pageData := testOggPage(b, 1, [][]byte{
+		bytes.Repeat([]byte{0x11}, 96),
+		bytes.Repeat([]byte{0x22}, 128),
+		bytes.Repeat([]byte{0x33}, 80),
+		bytes.Repeat([]byte{0x44}, 64),
+	})
+
+	var reader oggReader
+	r := bytes.NewReader(pageData)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		r.Reset(pageData)
+		if _, err := reader.readPage(r); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestTailBufferKeepsOnlyRecentBytes(t *testing.T) {
 	buf := newTailBuffer(5)
 	if n, err := buf.Write([]byte("abc")); err != nil || n != 3 {
@@ -424,6 +476,35 @@ func TestTailBufferKeepsOnlyRecentBytes(t *testing.T) {
 	if got := buf.String(); got != "lmnop" {
 		t.Fatalf("tail buffer = %q, want lmnop", got)
 	}
+}
+
+func testOggPage(tb testing.TB, sequence uint32, packets [][]byte) []byte {
+	tb.Helper()
+
+	var segmentTable []byte
+	var body []byte
+	for _, pkt := range packets {
+		remaining := len(pkt)
+		for remaining >= 255 {
+			segmentTable = append(segmentTable, 255)
+			remaining -= 255
+		}
+		segmentTable = append(segmentTable, byte(remaining))
+		body = append(body, pkt...)
+	}
+	if len(segmentTable) > 255 {
+		tb.Fatalf("test page has %d segments, max is 255", len(segmentTable))
+	}
+
+	page := make([]byte, 27, 27+len(segmentTable)+len(body))
+	copy(page[0:4], oggCapturePattern)
+	page[4] = 0
+	page[5] = 0
+	binary.LittleEndian.PutUint32(page[18:22], sequence)
+	page[26] = byte(len(segmentTable))
+	page = append(page, segmentTable...)
+	page = append(page, body...)
+	return page
 }
 
 func TestProcessOutputTailLabelsTrimmedTail(t *testing.T) {
