@@ -2,13 +2,10 @@ package main
 
 // Discord music bot – streams audio from YouTube via yt-dlp + ffmpeg.
 //
-// Audio pipeline (zero PCM conversion):
+// Audio pipeline:
 //
-//	yt-dlp stdout ──pipe──▶ ffmpeg (-c:a copy, OGG muxer) stdout
-//	                                       │
-//	                              oggDemux (this file)
-//	                                       │
-//	                              raw Opus packets ──▶ vc.OpusSend
+//	yt-dlp stdout -> ffmpeg OGG remux/copy or libopus encode -> oggReader
+//	                                                       -> vc.OpusSend
 //
 // The preferred path asks yt-dlp for an existing Opus stream and lets ffmpeg
 // remux it into OGG without re-encoding. Tracks without an Opus format fall
@@ -27,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,9 +56,9 @@ var (
 	BotID     string
 )
 
-// GetConfig loads configuration from config.json and then overrides any
-// fields with environment variables when present.
-// Order of precedence: env var > config.json > built-in default.
+// GetConfig loads file-backed settings, applies environment overrides, and
+// reads env-only runtime diagnostics.
+// Order of precedence for shared settings: env var > config.json > default.
 func GetConfig() {
 	log.Printf("Reading configuration...")
 
@@ -94,6 +92,10 @@ func GetConfig() {
 		}
 		maxStreams = parsed
 	}
+	memLogEvery, err := parsePlaybackMemLogInterval(os.Getenv("PLAYBACK_MEM_LOG_INTERVAL"))
+	if err != nil {
+		log.Fatalf("PLAYBACK_MEM_LOG_INTERVAL must be a Go duration like 30s or a positive number of seconds, got %q", os.Getenv("PLAYBACK_MEM_LOG_INTERVAL"))
+	}
 
 	if BotPrefix == "" {
 		BotPrefix = "&"
@@ -106,6 +108,7 @@ func GetConfig() {
 	}
 
 	configureStreamLimiter(maxStreams)
+	playbackMemLogEvery = memLogEvery
 
 	config = &configStruct{
 		Token:                Token,
@@ -177,7 +180,7 @@ type guildState struct {
 	// skipInterrupt is set to true by /skip to signal streamAudio to halt.
 	skipInterrupt      atomic.Bool
 	playbackGeneration atomic.Uint64
-	// intentionalLeave prevents botVoiceStateHandler from treating a
+	// intentionalLeave prevents voiceStateHandler from treating a
 	// programmatic disconnect as an external kick.
 	intentionalLeave atomic.Bool
 }
@@ -384,8 +387,8 @@ func (gs *guildState) prepareSkip() (autoplaySkipRequest, bool) {
 	return req, true
 }
 
-// resetPlaybackState clears the queue, kills active processes, and cancels
-// any pending idle-disconnect timer. Used by /stop and external kicks.
+// resetPlaybackState invalidates the current playback generation, clears queue
+// and autoplay state, kills active processes, and cancels idle disconnects.
 func (gs *guildState) resetPlaybackState() {
 	gs.playbackGeneration.Add(1)
 	gs.killPlaybackProcesses()
@@ -433,6 +436,7 @@ var (
 	rng   = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	errNotInVoice      = errors.New("not in a voice channel")
+	errOpusSendTimeout = errors.New("timed out sending audio packet to voice connection")
 	errPlaylistMaxSize = errors.New("playlist max size reached")
 
 	queuePageMinValue = 1.0
@@ -503,6 +507,7 @@ var (
 	maxConcurrentStreams = defaultMaxStreams
 	streamSlotsMu        sync.Mutex
 	streamLogSeq         atomic.Uint64
+	playbackMemLogEvery  time.Duration
 )
 
 func configureStreamLimiter(limit int) {
@@ -524,6 +529,27 @@ func streamSlotChannel() chan struct{} {
 func streamSlotStats() (int, int) {
 	slots := streamSlotChannel()
 	return len(slots), cap(slots)
+}
+
+func parsePlaybackMemLogInterval(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0" {
+		return 0, nil
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds < 1 {
+			return 0, fmt.Errorf("interval must be positive")
+		}
+		return time.Duration(seconds) * time.Second, nil
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if interval <= 0 {
+		return 0, fmt.Errorf("interval must be positive")
+	}
+	return interval, nil
 }
 
 func acquireStreamSlot(gs *guildState, generation uint64) (func(), time.Duration, bool) {
@@ -568,6 +594,116 @@ func streamEndReason(err error, interrupted, generationChanged bool) string {
 		return "error"
 	default:
 		return "finished"
+	}
+}
+
+type playbackMemSnapshot struct {
+	heapAlloc    uint64
+	heapSys      uint64
+	heapIdle     uint64
+	heapReleased uint64
+	stackInuse   uint64
+	nextGC       uint64
+	sys          uint64
+	rss          uint64
+	hasRSS       bool
+	numGC        uint32
+	goroutines   int
+}
+
+func capturePlaybackMemSnapshot() playbackMemSnapshot {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	rss, hasRSS := readProcessRSSBytes()
+	return playbackMemSnapshot{
+		heapAlloc:    m.HeapAlloc,
+		heapSys:      m.HeapSys,
+		heapIdle:     m.HeapIdle,
+		heapReleased: m.HeapReleased,
+		stackInuse:   m.StackInuse,
+		nextGC:       m.NextGC,
+		sys:          m.Sys,
+		rss:          rss,
+		hasRSS:       hasRSS,
+		numGC:        m.NumGC,
+		goroutines:   runtime.NumGoroutine(),
+	}
+}
+
+func readProcessRSSBytes() (uint64, bool) {
+	data, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return 0, false
+	}
+	pages, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return pages * uint64(os.Getpagesize()), true
+}
+
+func logPlaybackMemSnapshot(event string, streamID uint64, guildID string, elapsed time.Duration) {
+	s := capturePlaybackMemSnapshot()
+	active, capacity := streamSlotStats()
+	fields := fmt.Sprintf(
+		"playback mem: event=%s id=%d guild=%s elapsed=%s active=%d capacity=%d goroutines=%d heap_alloc=%d heap_sys=%d heap_idle=%d heap_released=%d stack_inuse=%d next_gc=%d sys=%d num_gc=%d",
+		event,
+		streamID,
+		guildID,
+		elapsed.Round(time.Millisecond),
+		active,
+		capacity,
+		s.goroutines,
+		s.heapAlloc,
+		s.heapSys,
+		s.heapIdle,
+		s.heapReleased,
+		s.stackInuse,
+		s.nextGC,
+		s.sys,
+		s.numGC,
+	)
+	if s.hasRSS {
+		fields += fmt.Sprintf(" rss=%d", s.rss)
+	}
+	log.Print(fields)
+}
+
+func startPlaybackMemLogger(streamID uint64, guildID string, started time.Time) func() {
+	interval := playbackMemLogEvery
+	if interval <= 0 {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+
+	logPlaybackMemSnapshot("start", streamID, guildID, time.Since(started))
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				logPlaybackMemSnapshot("tick", streamID, guildID, time.Since(started))
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+			logPlaybackMemSnapshot("end", streamID, guildID, time.Since(started))
+		})
 	}
 }
 
@@ -1490,11 +1626,10 @@ func fetchPlaylistEnqueue(ctx context.Context, s *discordgo.Session, guildID, te
 // Play flow
 // ---------------------------------------------------------------------------
 
-// runPlayFlow is the top-level handler for a /play command.
-// It decides whether the query is a playlist or a single track, then
-// delegates to the appropriate enqueue function.  Returns a human-readable
-// status string suitable for sending back to the user (may be empty for the
-// single-track happy path, where the Now Playing embed speaks for itself).
+// runPlayFlow resolves a /play query as either a playlist or a single track,
+// enqueues the result, and returns the status text for the interaction. An
+// empty status means the caller should use the standard single-track queued
+// response.
 func runPlayFlow(ctx context.Context, s *discordgo.Session, guildID, textChannelID, voiceChannelID, query string) string {
 	if strings.Contains(query, "list=") {
 		_, _ = s.ChannelMessageSend(textChannelID, "Resolving playlist…")
@@ -1554,8 +1689,9 @@ func enqueueTrack(s *discordgo.Session, guildID, textChannelID, voiceChannelID s
 // Playback loop
 // ---------------------------------------------------------------------------
 
-// playNextSong is the main playback loop for a guild.  It runs as a goroutine
-// and processes the queue until it is empty, then returns.
+// playNextSong is the main playback loop for a guild. It processes queued
+// tracks, optionally extends the queue through autoplay, and exits when the
+// playback generation changes or no more work remains.
 func playNextSong(s *discordgo.Session, guildID, textChannelID string, generation uint64) {
 	gs := getGuildState(guildID)
 
@@ -1702,9 +1838,11 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 		streamStarted := time.Now()
 		log.Printf("stream audio start: id=%d guild=%s voice=%s track=%q url=%s",
 			streamID, guildID, song.channelID, trackLabel, song.track.URL)
+		stopMemLogger := startPlaybackMemLogger(streamID, guildID, streamStarted)
 		err = streamAudio(gs, vc, dl, song.track.URL, generation)
 		interrupted := gs.skipInterrupt.Load()
 		generationChanged := gs.playbackGeneration.Load() != generation
+		stopMemLogger()
 		releaseStreamSlot()
 		activeSlots, slotCapacity = streamSlotStats()
 		reason := streamEndReason(err, interrupted, generationChanged)
@@ -1724,6 +1862,11 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 				_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
 			} else {
 				log.Printf("stream: %v", err)
+				if errors.Is(err, errOpusSendTimeout) {
+					log.Printf("voice local reset after send timeout: id=%d guild=%s voice=%s",
+						streamID, guildID, song.channelID)
+					vc.Close()
+				}
 				msg := "Playback error; skipping to next track."
 				if gs.disableAutoplayAfterPlaybackError(generation) {
 					msg = "Playback error; autoplay disabled to avoid a retry loop. Skipping to next track."
@@ -2033,10 +2176,10 @@ func pluralize(n int, singular, plural string) string {
 // OGG/Opus demuxer
 // ---------------------------------------------------------------------------
 //
-// ffmpeg writes an OGG container when told to encode with libopus.  OGG pages
-// have a fixed 27-byte header plus a variable-length segment table.  The first
-// two pages are the Opus identification and comment headers; every subsequent
-// page carries audio packets that can be forwarded verbatim to Discord.
+// ffmpeg writes an OGG container for both the Opus-copy and libopus-transcode
+// pipelines. OGG pages have a fixed 27-byte header plus a variable-length
+// segment table. The first two pages are the Opus identification and comment
+// headers; subsequent pages carry Opus packets that are forwarded to Discord.
 //
 // OGG page layout (https://www.rfc-editor.org/rfc/rfc3533):
 //
@@ -2211,6 +2354,25 @@ func streamProcessError(reason string, err error, dlStderr, ffStderr *tailBuffer
 	return fmt.Errorf("%s: %w; %s", reason, err, strings.Join(details, " | "))
 }
 
+func voiceConnectionSendState(vc *discordgo.VoiceConnection) string {
+	if vc == nil {
+		return "voice_state=nil"
+	}
+	vc.RLock()
+	ready := vc.Ready
+	guildID := vc.GuildID
+	channelID := vc.ChannelID
+	vc.RUnlock()
+
+	queueLen, queueCap := 0, 0
+	if vc.OpusSend != nil {
+		queueLen = len(vc.OpusSend)
+		queueCap = cap(vc.OpusSend)
+	}
+	return fmt.Sprintf("voice_state=ready:%t guild:%s channel:%s opus_queue:%d/%d",
+		ready, guildID, channelID, queueLen, queueCap)
+}
+
 func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte, generation uint64) error {
 	if vc == nil || vc.OpusSend == nil {
 		return errors.New("voice connection is not ready to send audio")
@@ -2236,15 +2398,15 @@ func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte, g
 		case vc.OpusSend <- pkt:
 			return nil
 		case <-timeout.C:
-			return errors.New("timed out sending audio packet to voice connection")
+			return fmt.Errorf("%w (%s)", errOpusSendTimeout, voiceConnectionSendState(vc))
 		case <-ticker.C:
 		}
 	}
 }
 
-// streamAudio pipes yt-dlp into ffmpeg and forwards raw Opus packets directly
-// to Discord. It prefers copying an existing YouTube Opus stream into an OGG
-// container, falling back to libopus transcoding only when copy cannot start.
+// streamAudio pipes yt-dlp into ffmpeg and forwards Opus packets to Discord.
+// It prefers remuxing an existing YouTube Opus stream and falls back to libopus
+// transcoding only if the copy pipeline fails before sending audio packets.
 func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string, generation uint64) error {
 	packetsSent, err := streamAudioPipeline(gs, vc, dl, youtubeURL, generation, opusCopyPipeline)
 	if err == nil || gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
@@ -2334,7 +2496,7 @@ func streamAudioPipeline(gs *guildState, vc *discordgo.VoiceConnection, dl, yout
 		}
 	}
 
-	// Stream audio pages until EOF or skip signal.
+	// Stream audio pages until EOF, skip, or playback generation change.
 	packetsSent := 0
 	for {
 		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {

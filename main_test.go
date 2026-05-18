@@ -293,6 +293,40 @@ func TestConfigureStreamLimiterDefaultsToFive(t *testing.T) {
 	}
 }
 
+func TestParsePlaybackMemLogInterval(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "empty", value: "", want: 0},
+		{name: "zero", value: "0", want: 0},
+		{name: "duration", value: "250ms", want: 250 * time.Millisecond},
+		{name: "seconds", value: "30", want: 30 * time.Second},
+		{name: "negative", value: "-1s", wantErr: true},
+		{name: "invalid", value: "soon", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parsePlaybackMemLogInterval(tt.value)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parsePlaybackMemLogInterval(%q) error = nil, want error", tt.value)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parsePlaybackMemLogInterval(%q) error = %v", tt.value, err)
+			}
+			if got != tt.want {
+				t.Fatalf("parsePlaybackMemLogInterval(%q) = %s, want %s", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStreamLimiterWaitsForCapacity(t *testing.T) {
 	t.Cleanup(func() { configureStreamLimiter(defaultMaxStreams) })
 	configureStreamLimiter(1)
@@ -837,6 +871,28 @@ func TestSendOpusPacketSendsOnReadyChannel(t *testing.T) {
 		}
 	default:
 		t.Fatal("sendOpusPacket did not send to ready channel")
+	}
+}
+
+func TestVoiceConnectionSendStateIncludesQueueAndReadyState(t *testing.T) {
+	vc := &discordgo.VoiceConnection{
+		Ready:     true,
+		GuildID:   "guild",
+		ChannelID: "voice",
+		OpusSend:  make(chan []byte, 2),
+	}
+	vc.OpusSend <- []byte{1}
+
+	state := voiceConnectionSendState(vc)
+	for _, want := range []string{
+		"ready:true",
+		"guild:guild",
+		"channel:voice",
+		"opus_queue:1/2",
+	} {
+		if !strings.Contains(state, want) {
+			t.Fatalf("voiceConnectionSendState() = %q, want %q", state, want)
+		}
 	}
 }
 
