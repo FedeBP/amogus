@@ -4,18 +4,17 @@ package main
 //
 // Audio pipeline (zero PCM conversion):
 //
-//	yt-dlp stdout ──pipe──▶ ffmpeg (-c:a libopus, OGG muxer) stdout
+//	yt-dlp stdout ──pipe──▶ ffmpeg (-c:a copy, OGG muxer) stdout
 //	                                       │
 //	                              oggDemux (this file)
 //	                                       │
 //	                              raw Opus packets ──▶ vc.OpusSend
 //
-// Removing the PCM → gopus encode step cuts CPU usage significantly because
-// ffmpeg's native libopus encoder runs in a single optimised C call rather
-// than bouncing through a Go ↔ Cgo ↔ libopus round-trip per 20 ms frame.
+// The preferred path asks yt-dlp for an existing Opus stream and lets ffmpeg
+// remux it into OGG without re-encoding. Tracks without an Opus format fall
+// back to ffmpeg's native libopus encoder.
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -145,6 +144,12 @@ type SearchResult struct {
 }
 
 type guildAction func()
+
+type audioPipeline struct {
+	name        string
+	ytdlpFormat string
+	ffmpegArgs  []string
+}
 
 // ---------------------------------------------------------------------------
 // Per-guild playback state
@@ -447,6 +452,7 @@ const (
 	idleDisconnectTimeout  = 5 * time.Minute
 	opusSendTimeout        = 2 * time.Second
 	opusSendPollInterval   = 20 * time.Millisecond
+	processOutputTailMax   = 2000
 )
 
 const (
@@ -454,6 +460,39 @@ const (
 	nowPlayingButtonStop     = "nowplaying:stop"
 	nowPlayingButtonQueue    = "nowplaying:queue"
 	nowPlayingButtonAutoplay = "nowplaying:autoplay"
+)
+
+var (
+	opusCopyPipeline = audioPipeline{
+		name:        "opus_copy",
+		ytdlpFormat: "bestaudio[acodec=opus]",
+		ffmpegArgs: []string{
+			"-nostdin",
+			"-hide_banner",
+			"-loglevel", "warning",
+			"-i", "pipe:0",
+			"-c:a", "copy",
+			"-f", "ogg",
+			"pipe:1",
+		},
+	}
+	opusTranscodePipeline = audioPipeline{
+		name:        "opus_transcode",
+		ytdlpFormat: "bestaudio",
+		ffmpegArgs: []string{
+			"-nostdin",
+			"-hide_banner",
+			"-loglevel", "warning",
+			"-i", "pipe:0",
+			"-c:a", "libopus",
+			"-ar", "48000",
+			"-ac", "2",
+			"-b:a", "128k",
+			"-vbr", "on",
+			"-f", "ogg",
+			"pipe:1",
+		},
+	}
 )
 
 var (
@@ -2001,19 +2040,64 @@ func readOggPage(r io.Reader) (*oggPage, error) {
 // Audio streaming
 // ---------------------------------------------------------------------------
 
-func processOutputTail(name string, stderr *bytes.Buffer) string {
+type tailBuffer struct {
+	mu  sync.Mutex
+	max int
+	buf []byte
+}
+
+func newTailBuffer(max int) *tailBuffer {
+	if max < 1 {
+		max = processOutputTailMax
+	}
+	return &tailBuffer{max: max}
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	if b == nil {
+		return len(p), nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if len(p) >= b.max {
+		if cap(b.buf) < b.max {
+			b.buf = make([]byte, b.max)
+		}
+		b.buf = b.buf[:b.max]
+		copy(b.buf, p[len(p)-b.max:])
+		return len(p), nil
+	}
+
+	b.buf = append(b.buf, p...)
+	if overflow := len(b.buf) - b.max; overflow > 0 {
+		copy(b.buf, b.buf[overflow:])
+		b.buf = b.buf[:b.max]
+	}
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.buf)
+}
+
+func processOutputTail(name string, stderr *tailBuffer) string {
+	if stderr == nil {
+		return ""
+	}
 	output := strings.TrimSpace(stderr.String())
 	if output == "" {
 		return ""
 	}
-	const maxOutputLen = 2000
-	if len(output) > maxOutputLen {
-		output = output[len(output)-maxOutputLen:]
-	}
 	return name + " stderr: " + output
 }
 
-func streamProcessError(reason string, err error, dlStderr, ffStderr *bytes.Buffer) error {
+func streamProcessError(reason string, err error, dlStderr, ffStderr *tailBuffer) error {
 	details := make([]string, 0, 2)
 	if output := processOutputTail("yt-dlp", dlStderr); output != "" {
 		details = append(details, output)
@@ -2049,58 +2133,60 @@ func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte, g
 	}
 }
 
-// streamAudio pipes yt-dlp into ffmpeg (native Opus encoding) and forwards
-// raw Opus packets directly to Discord — no PCM conversion or Go-side encoding.
-//
-// Pipeline:
-//
-//	yt-dlp -f bestaudio -o - <url>
-//	      └─pipe─▶ ffmpeg -i pipe:0 -c:a libopus -ar 48000 -ac 2
-//	                       -b:a 128k -vbr on -f ogg pipe:1
-//	                              └─oggDemux─▶ vc.OpusSend
-//
-// The two Opus header pages (identification + comment) are skipped;
-// every audio packet thereafter is sent as-is.
+// streamAudio pipes yt-dlp into ffmpeg and forwards raw Opus packets directly
+// to Discord. It prefers copying an existing YouTube Opus stream into an OGG
+// container, falling back to libopus transcoding only when copy cannot start.
 func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string, generation uint64) error {
-	var dlStderr, ffStderr bytes.Buffer
+	packetsSent, err := streamAudioPipeline(gs, vc, dl, youtubeURL, generation, opusCopyPipeline)
+	if err == nil || gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
+		return err
+	}
+	if packetsSent > 0 {
+		return err
+	}
+	log.Printf("stream pipeline fallback: from=%s to=%s url=%s err=%v",
+		opusCopyPipeline.name, opusTranscodePipeline.name, youtubeURL, err)
+	_, err = streamAudioPipeline(gs, vc, dl, youtubeURL, generation, opusTranscodePipeline)
+	return err
+}
 
-	dlCmd := exec.Command(dl,
+func ytdlpCommandArgs(pipeline audioPipeline, youtubeURL string) []string {
+	return []string{
 		"--no-playlist",
-		"-f", "bestaudio",
+		"--no-progress",
+		"-f", pipeline.ytdlpFormat,
 		"-o", "-",
 		youtubeURL,
-	)
-	dlCmd.Stderr = &dlStderr
+	}
+}
 
-	ffCmd := exec.Command("ffmpeg",
-		"-i", "pipe:0",
-		"-c:a", "libopus",
-		"-ar", "48000",
-		"-ac", "2",
-		"-b:a", "128k",
-		"-vbr", "on",
-		"-f", "ogg",
-		"pipe:1",
-	)
-	ffCmd.Stderr = &ffStderr
+func streamAudioPipeline(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL string, generation uint64, pipeline audioPipeline) (int, error) {
+	dlStderr := newTailBuffer(processOutputTailMax)
+	ffStderr := newTailBuffer(processOutputTailMax)
+
+	dlCmd := exec.Command(dl, ytdlpCommandArgs(pipeline, youtubeURL)...)
+	dlCmd.Stderr = dlStderr
+
+	ffCmd := exec.Command("ffmpeg", pipeline.ffmpegArgs...)
+	ffCmd.Stderr = ffStderr
 
 	dlStdout, err := dlCmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("yt-dlp stdout pipe: %w", err)
+		return 0, fmt.Errorf("%s yt-dlp stdout pipe: %w", pipeline.name, err)
 	}
 	ffCmd.Stdin = dlStdout
 
 	ffStdout, err := ffCmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("ffmpeg stdout pipe: %w", err)
+		return 0, fmt.Errorf("%s ffmpeg stdout pipe: %w", pipeline.name, err)
 	}
 
 	if err := dlCmd.Start(); err != nil {
-		return streamProcessError("yt-dlp start", err, &dlStderr, &ffStderr)
+		return 0, streamProcessError(pipeline.name+" yt-dlp start", err, dlStderr, ffStderr)
 	}
 	if err := ffCmd.Start(); err != nil {
 		_ = dlCmd.Process.Kill()
-		return streamProcessError("ffmpeg start", err, &dlStderr, &ffStderr)
+		return 0, streamProcessError(pipeline.name+" ffmpeg start", err, dlStderr, ffStderr)
 	}
 
 	// Register active processes so skip/stop can kill them immediately.
@@ -2133,11 +2219,12 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 			_ = dlCmd.Process.Kill()
 			_ = ffCmd.Process.Kill()
 			_, _ = dlCmd.Wait(), ffCmd.Wait()
-			return streamProcessError(fmt.Sprintf("ogg header page %d", skip), err, &dlStderr, &ffStderr)
+			return 0, streamProcessError(fmt.Sprintf("%s ogg header page %d", pipeline.name, skip), err, dlStderr, ffStderr)
 		}
 	}
 
 	// Stream audio pages until EOF or skip signal.
+	packetsSent := 0
 	for {
 		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
 			break
@@ -2154,7 +2241,7 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 			_ = dlCmd.Process.Kill()
 			_ = ffCmd.Process.Kill()
 			_, _ = dlCmd.Wait(), ffCmd.Wait()
-			return streamProcessError("ogg demux", err, &dlStderr, &ffStderr)
+			return packetsSent, streamProcessError(pipeline.name+" ogg demux", err, dlStderr, ffStderr)
 		}
 
 		for _, pkt := range page.packets {
@@ -2166,7 +2253,10 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 					_ = dlCmd.Process.Kill()
 					_ = ffCmd.Process.Kill()
 					_, _ = dlCmd.Wait(), ffCmd.Wait()
-					return err
+					return packetsSent, err
+				}
+				if !gs.skipInterrupt.Load() && gs.playbackGeneration.Load() == generation {
+					packetsSent++
 				}
 			}
 		}
@@ -2180,15 +2270,15 @@ func streamAudio(gs *guildState, vc *discordgo.VoiceConnection, dl, youtubeURL s
 	dlErr := dlCmd.Wait()
 	ffErr := ffCmd.Wait()
 	if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
-		return nil
+		return packetsSent, nil
 	}
 	if dlErr != nil {
-		return streamProcessError("yt-dlp exit", dlErr, &dlStderr, &ffStderr)
+		return packetsSent, streamProcessError(pipeline.name+" yt-dlp exit", dlErr, dlStderr, ffStderr)
 	}
 	if ffErr != nil {
-		return streamProcessError("ffmpeg exit", ffErr, &dlStderr, &ffStderr)
+		return packetsSent, streamProcessError(pipeline.name+" ffmpeg exit", ffErr, dlStderr, ffStderr)
 	}
-	return nil
+	return packetsSent, nil
 }
 
 // ---------------------------------------------------------------------------

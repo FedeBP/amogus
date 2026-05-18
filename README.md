@@ -175,10 +175,10 @@ Reasonable options:
 The bot streams directly:
 
 ```text
-yt-dlp stdout -> ffmpeg libopus OGG stdout -> OGG demux -> Discord OpusSend
+yt-dlp Opus stdout -> ffmpeg OGG remux/copy -> OGG demux -> Discord OpusSend
 ```
 
-There is no Go-side PCM decode/encode step.
+There is no Go-side PCM decode/encode step. When a video has no usable Opus format, the bot falls back to `ffmpeg`'s `libopus` encoder for that track.
 
 ## License
 

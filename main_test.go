@@ -365,6 +365,76 @@ func TestStreamLimiterCancelsWhenPlaybackIsInterrupted(t *testing.T) {
 	}
 }
 
+func TestOpusCopyPipelineAvoidsTranscoding(t *testing.T) {
+	if opusCopyPipeline.ytdlpFormat != "bestaudio[acodec=opus]" {
+		t.Fatalf("copy ytdlp format = %q, want opus-only format", opusCopyPipeline.ytdlpFormat)
+	}
+
+	args := strings.Join(opusCopyPipeline.ffmpegArgs, " ")
+	if !strings.Contains(args, "-nostdin -hide_banner -loglevel warning") {
+		t.Fatalf("copy ffmpeg args = %q, want quiet noninteractive flags", args)
+	}
+	if !strings.Contains(args, "-c:a copy") {
+		t.Fatalf("copy ffmpeg args = %q, want -c:a copy", args)
+	}
+	if strings.Contains(args, "libopus") {
+		t.Fatalf("copy ffmpeg args = %q, should not transcode with libopus", args)
+	}
+}
+
+func TestOpusTranscodePipelineKeepsFallbackEncoder(t *testing.T) {
+	if opusTranscodePipeline.ytdlpFormat != "bestaudio" {
+		t.Fatalf("transcode ytdlp format = %q, want bestaudio fallback", opusTranscodePipeline.ytdlpFormat)
+	}
+
+	args := strings.Join(opusTranscodePipeline.ffmpegArgs, " ")
+	if !strings.Contains(args, "-nostdin -hide_banner -loglevel warning") {
+		t.Fatalf("transcode ffmpeg args = %q, want quiet noninteractive flags", args)
+	}
+	if !strings.Contains(args, "-c:a libopus") {
+		t.Fatalf("transcode ffmpeg args = %q, want libopus fallback", args)
+	}
+}
+
+func TestYtdlpCommandArgsDisableProgress(t *testing.T) {
+	args := strings.Join(ytdlpCommandArgs(opusCopyPipeline, "https://example.test/video"), " ")
+	if !strings.Contains(args, "--no-progress") {
+		t.Fatalf("yt-dlp args = %q, want --no-progress", args)
+	}
+	if !strings.Contains(args, "-f bestaudio[acodec=opus]") {
+		t.Fatalf("yt-dlp args = %q, want copy pipeline format", args)
+	}
+}
+
+func TestTailBufferKeepsOnlyRecentBytes(t *testing.T) {
+	buf := newTailBuffer(5)
+	if n, err := buf.Write([]byte("abc")); err != nil || n != 3 {
+		t.Fatalf("first Write() = %d, %v; want 3, nil", n, err)
+	}
+	if n, err := buf.Write([]byte("defgh")); err != nil || n != 5 {
+		t.Fatalf("second Write() = %d, %v; want 5, nil", n, err)
+	}
+	if got := buf.String(); got != "defgh" {
+		t.Fatalf("tail buffer = %q, want defgh", got)
+	}
+
+	if n, err := buf.Write([]byte("ijklmnop")); err != nil || n != 8 {
+		t.Fatalf("large Write() = %d, %v; want 8, nil", n, err)
+	}
+	if got := buf.String(); got != "lmnop" {
+		t.Fatalf("tail buffer = %q, want lmnop", got)
+	}
+}
+
+func TestProcessOutputTailLabelsTrimmedTail(t *testing.T) {
+	buf := newTailBuffer(20)
+	_, _ = buf.Write([]byte("  useful error  \n"))
+
+	if got := processOutputTail("ffmpeg", buf); got != "ffmpeg stderr: useful error" {
+		t.Fatalf("processOutputTail() = %q, want labelled trimmed stderr", got)
+	}
+}
+
 func TestStopAfterAutoplayErrorKeepsLoopAliveForQueuedTrack(t *testing.T) {
 	gs := &guildState{
 		songQueue: []Song{
