@@ -90,4 +90,4 @@ def radio():
 
 print("YTMusic search backend started on :5000")
 
-serve(app, host="127.0.0.1", port=5000, threads=8)
+serve(app, host="127.0.0.1", port=5000, threads=4)

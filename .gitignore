@@ -32,3 +32,6 @@ config.local.json
 
 # fly
 fly.toml
+
+# python cache
+__pycache__
