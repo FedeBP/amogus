@@ -24,7 +24,8 @@ go.work
 audio.mp3*
 
 # Secrets (use env vars on the host or a private secret store)
-config.json
+/config.json
+config.local.json
 
 # github
 .github/

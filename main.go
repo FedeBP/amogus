@@ -2115,6 +2115,15 @@ func sendOpusPacket(gs *guildState, vc *discordgo.VoiceConnection, pkt []byte, g
 	if vc == nil || vc.OpusSend == nil {
 		return errors.New("voice connection is not ready to send audio")
 	}
+	if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
+		return nil
+	}
+	select {
+	case vc.OpusSend <- pkt:
+		return nil
+	default:
+	}
+
 	timeout := time.NewTimer(opusSendTimeout)
 	defer timeout.Stop()
 	ticker := time.NewTicker(opusSendPollInterval)

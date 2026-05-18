@@ -627,6 +627,41 @@ func TestSendOpusPacketReturnsWhenGenerationChanges(t *testing.T) {
 	}
 }
 
+func TestSendOpusPacketSendsOnReadyChannel(t *testing.T) {
+	gs := &guildState{}
+	vc := &discordgo.VoiceConnection{OpusSend: make(chan []byte, 1)}
+	generation := gs.playbackGeneration.Load()
+	pkt := []byte{1, 2, 3}
+
+	if err := sendOpusPacket(gs, vc, pkt, generation); err != nil {
+		t.Fatalf("sendOpusPacket() error = %v, want nil", err)
+	}
+
+	select {
+	case got := <-vc.OpusSend:
+		if string(got) != string(pkt) {
+			t.Fatalf("packet = %v, want %v", got, pkt)
+		}
+	default:
+		t.Fatal("sendOpusPacket did not send to ready channel")
+	}
+}
+
+func BenchmarkSendOpusPacketFastPath(b *testing.B) {
+	gs := &guildState{}
+	vc := &discordgo.VoiceConnection{OpusSend: make(chan []byte, 1)}
+	generation := gs.playbackGeneration.Load()
+	pkt := []byte{1, 2, 3}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if err := sendOpusPacket(gs, vc, pkt, generation); err != nil {
+			b.Fatal(err)
+		}
+		<-vc.OpusSend
+	}
+}
+
 func TestPrepareSkipWithAutoplayResetsPlayingState(t *testing.T) {
 	gs := &guildState{
 		isPlaying:          true,
