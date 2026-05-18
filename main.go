@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,9 +45,10 @@ import (
 // ---------------------------------------------------------------------------
 
 type configStruct struct {
-	Token     string `json:"token"`
-	BotPrefix string `json:"botPrefix"`
-	APIKey    string `json:"APIKey"`
+	Token                string `json:"token"`
+	BotPrefix            string `json:"botPrefix"`
+	APIKey               string `json:"APIKey"`
+	MaxConcurrentStreams int    `json:"MAX_CONCURRENT_STREAMS"`
 }
 
 var (
@@ -85,6 +87,14 @@ func GetConfig() {
 	if v := strings.TrimSpace(os.Getenv("BOT_PREFIX")); v != "" {
 		BotPrefix = v
 	}
+	maxStreams := fileCfg.MaxConcurrentStreams
+	if v := strings.TrimSpace(os.Getenv("MAX_CONCURRENT_STREAMS")); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil || parsed < 1 {
+			log.Fatalf("MAX_CONCURRENT_STREAMS must be a positive integer, got %q", v)
+		}
+		maxStreams = parsed
+	}
 
 	if BotPrefix == "" {
 		BotPrefix = "&"
@@ -96,8 +106,15 @@ func GetConfig() {
 		log.Fatal("Missing YouTube API key: set YOUTUBE_API_KEY or 'APIKey' in config.json")
 	}
 
-	config = &configStruct{Token: Token, BotPrefix: BotPrefix, APIKey: APIKey}
-	log.Printf("Configuration loaded.")
+	configureStreamLimiter(maxStreams)
+
+	config = &configStruct{
+		Token:                Token,
+		BotPrefix:            BotPrefix,
+		APIKey:               APIKey,
+		MaxConcurrentStreams: maxConcurrentStreams,
+	}
+	log.Printf("Configuration loaded. Max concurrent streams: %d.", maxConcurrentStreams)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +443,7 @@ const (
 	queueLineMaxLen        = 120
 	discordFieldValueMax   = 1024
 	guildActionQueueSize   = 64
+	defaultMaxStreams      = 5
 	idleDisconnectTimeout  = 5 * time.Minute
 	opusSendTimeout        = 2 * time.Second
 	opusSendPollInterval   = 20 * time.Millisecond
@@ -437,6 +455,79 @@ const (
 	nowPlayingButtonQueue    = "nowplaying:queue"
 	nowPlayingButtonAutoplay = "nowplaying:autoplay"
 )
+
+var (
+	streamSlots          = make(chan struct{}, defaultMaxStreams)
+	maxConcurrentStreams = defaultMaxStreams
+	streamSlotsMu        sync.Mutex
+	streamLogSeq         atomic.Uint64
+)
+
+func configureStreamLimiter(limit int) {
+	if limit < 1 {
+		limit = defaultMaxStreams
+	}
+	streamSlotsMu.Lock()
+	defer streamSlotsMu.Unlock()
+	streamSlots = make(chan struct{}, limit)
+	maxConcurrentStreams = limit
+}
+
+func streamSlotChannel() chan struct{} {
+	streamSlotsMu.Lock()
+	defer streamSlotsMu.Unlock()
+	return streamSlots
+}
+
+func streamSlotStats() (int, int) {
+	slots := streamSlotChannel()
+	return len(slots), cap(slots)
+}
+
+func acquireStreamSlot(gs *guildState, generation uint64) (func(), time.Duration, bool) {
+	slots := streamSlotChannel()
+	waitStarted := time.Now()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if gs.skipInterrupt.Load() || gs.playbackGeneration.Load() != generation {
+			return nil, time.Since(waitStarted), false
+		}
+		select {
+		case slots <- struct{}{}:
+			return func() { <-slots }, time.Since(waitStarted), true
+		case <-ticker.C:
+		}
+	}
+}
+
+func trackLogLabel(t Track) string {
+	label := strings.TrimSpace(t.Title)
+	if t.Artist != "" {
+		if label != "" {
+			label += " - "
+		}
+		label += strings.TrimSpace(t.Artist)
+	}
+	if label == "" {
+		label = t.URL
+	}
+	return truncateRunes(label, 120)
+}
+
+func streamEndReason(err error, interrupted, generationChanged bool) string {
+	switch {
+	case generationChanged:
+		return "generation_changed"
+	case interrupted:
+		return "interrupted"
+	case err != nil:
+		return "error"
+	default:
+		return "finished"
+	}
+}
 
 // searchCache caches YTMusic search results for 10 minutes to avoid
 // redundant HTTP round-trips to the Python sidecar during autocomplete.
@@ -1438,8 +1529,41 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 
 		gs.skipInterrupt.Store(false)
 
+		streamID := streamLogSeq.Add(1)
+		trackLabel := trackLogLabel(song.track)
+		activeSlots, slotCapacity := streamSlotStats()
+		if activeSlots >= slotCapacity {
+			log.Printf("stream wait: id=%d guild=%s voice=%s active=%d capacity=%d track=%q url=%s",
+				streamID, guildID, song.channelID, activeSlots, slotCapacity, trackLabel, song.track.URL)
+		}
+
+		releaseStreamSlot, slotWait, ok := acquireStreamSlot(gs, generation)
+		if !ok {
+			reason := streamEndReason(nil, gs.skipInterrupt.Load(), gs.playbackGeneration.Load() != generation)
+			activeSlots, slotCapacity = streamSlotStats()
+			log.Printf("stream wait canceled: id=%d guild=%s reason=%s wait=%s active=%d capacity=%d track=%q url=%s",
+				streamID, guildID, reason, slotWait.Round(time.Millisecond), activeSlots, slotCapacity, trackLabel, song.track.URL)
+			if gs.playbackGeneration.Load() != generation {
+				return
+			}
+			if gs.skipInterrupt.Load() {
+				gs.skipInterrupt.Store(false)
+				_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
+				continue
+			}
+			return
+		}
+		activeSlots, slotCapacity = streamSlotStats()
+		log.Printf("stream slot acquired: id=%d guild=%s voice=%s wait=%s active=%d capacity=%d track=%q url=%s",
+			streamID, guildID, song.channelID, slotWait.Round(time.Millisecond), activeSlots, slotCapacity, trackLabel, song.track.URL)
+
+		log.Printf("voice join start: id=%d guild=%s voice=%s", streamID, guildID, song.channelID)
 		vc, err := s.ChannelVoiceJoin(song.guildID, song.channelID, false, true)
 		if err != nil {
+			releaseStreamSlot()
+			activeSlots, slotCapacity = streamSlotStats()
+			log.Printf("voice join failed: id=%d guild=%s voice=%s active=%d capacity=%d err=%v",
+				streamID, guildID, song.channelID, activeSlots, slotCapacity, err)
 			if gs.playbackGeneration.Load() != generation {
 				return
 			}
@@ -1454,10 +1578,26 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 			_, _ = s.ChannelMessageSend(textChannelID, fmt.Sprintf("Could not join voice: %v", err))
 			return
 		}
+		log.Printf("voice join ok: id=%d guild=%s voice=%s", streamID, guildID, song.channelID)
 
 		sendNowPlayingEmbed(s, gs, textChannelID, song.track)
 
+		streamStarted := time.Now()
+		log.Printf("stream audio start: id=%d guild=%s voice=%s track=%q url=%s",
+			streamID, guildID, song.channelID, trackLabel, song.track.URL)
 		err = streamAudio(gs, vc, dl, song.track.URL, generation)
+		interrupted := gs.skipInterrupt.Load()
+		generationChanged := gs.playbackGeneration.Load() != generation
+		releaseStreamSlot()
+		activeSlots, slotCapacity = streamSlotStats()
+		reason := streamEndReason(err, interrupted, generationChanged)
+		if err != nil {
+			log.Printf("stream audio end: id=%d guild=%s reason=%s duration=%s active=%d capacity=%d err=%v",
+				streamID, guildID, reason, time.Since(streamStarted).Round(time.Millisecond), activeSlots, slotCapacity, err)
+		} else {
+			log.Printf("stream audio end: id=%d guild=%s reason=%s duration=%s active=%d capacity=%d",
+				streamID, guildID, reason, time.Since(streamStarted).Round(time.Millisecond), activeSlots, slotCapacity)
+		}
 		if err != nil {
 			if gs.playbackGeneration.Load() != generation {
 				return

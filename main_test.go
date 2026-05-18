@@ -243,6 +243,128 @@ func TestGuildActionsRunInQueuedOrder(t *testing.T) {
 	}
 }
 
+func TestGuildActionsRunConcurrentlyAcrossGuilds(t *testing.T) {
+	gs1 := newGuildState()
+	gs2 := newGuildState()
+	defer close(gs1.actionQueue)
+	defer close(gs2.actionQueue)
+
+	started1 := make(chan struct{})
+	finished2 := make(chan struct{})
+	release1 := make(chan struct{})
+
+	if !gs1.enqueueAction(func() {
+		close(started1)
+		<-release1
+	}) {
+		t.Fatal("first guild enqueueAction() = false, want true")
+	}
+	if !gs2.enqueueAction(func() {
+		close(finished2)
+	}) {
+		t.Fatal("second guild enqueueAction() = false, want true")
+	}
+
+	select {
+	case <-started1:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for first guild action to start")
+	}
+	select {
+	case <-finished2:
+	case <-time.After(time.Second):
+		t.Fatal("second guild action was blocked by first guild action")
+	}
+	close(release1)
+}
+
+func TestConfigureStreamLimiterDefaultsToFive(t *testing.T) {
+	t.Cleanup(func() { configureStreamLimiter(defaultMaxStreams) })
+
+	configureStreamLimiter(0)
+
+	if maxConcurrentStreams != defaultMaxStreams {
+		t.Fatalf("maxConcurrentStreams = %d, want %d", maxConcurrentStreams, defaultMaxStreams)
+	}
+	if cap(streamSlotChannel()) != defaultMaxStreams {
+		t.Fatalf("stream slot capacity = %d, want %d", cap(streamSlotChannel()), defaultMaxStreams)
+	}
+}
+
+func TestStreamLimiterWaitsForCapacity(t *testing.T) {
+	t.Cleanup(func() { configureStreamLimiter(defaultMaxStreams) })
+	configureStreamLimiter(1)
+
+	gs1 := &guildState{}
+	release1, _, ok := acquireStreamSlot(gs1, gs1.playbackGeneration.Load())
+	if !ok {
+		t.Fatal("first acquireStreamSlot() = false, want true")
+	}
+
+	gs2 := &guildState{}
+	done := make(chan bool, 1)
+	go func() {
+		release2, _, ok := acquireStreamSlot(gs2, gs2.playbackGeneration.Load())
+		if ok {
+			release2()
+		}
+		done <- ok
+	}()
+
+	select {
+	case ok := <-done:
+		t.Fatalf("second acquireStreamSlot() completed early with %v", ok)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	release1()
+
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("second acquireStreamSlot() = false, want true after capacity frees")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second stream slot")
+	}
+}
+
+func TestStreamLimiterCancelsWhenPlaybackIsInterrupted(t *testing.T) {
+	t.Cleanup(func() { configureStreamLimiter(defaultMaxStreams) })
+	configureStreamLimiter(1)
+
+	gs1 := &guildState{}
+	release1, _, ok := acquireStreamSlot(gs1, gs1.playbackGeneration.Load())
+	if !ok {
+		t.Fatal("first acquireStreamSlot() = false, want true")
+	}
+	defer release1()
+
+	gs2 := &guildState{}
+	done := make(chan bool, 1)
+	go func() {
+		_, _, ok := acquireStreamSlot(gs2, gs2.playbackGeneration.Load())
+		done <- ok
+	}()
+
+	select {
+	case ok := <-done:
+		t.Fatalf("second acquireStreamSlot() completed early with %v", ok)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	gs2.skipInterrupt.Store(true)
+
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("second acquireStreamSlot() = true, want false after interrupt")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for interrupted stream slot")
+	}
+}
+
 func TestStopAfterAutoplayErrorKeepsLoopAliveForQueuedTrack(t *testing.T) {
 	gs := &guildState{
 		songQueue: []Song{
