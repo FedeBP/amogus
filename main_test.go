@@ -16,10 +16,14 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 		songQueue: []Song{
 			{guildID: "guild", channelID: "voice", track: Track{URL: "https://www.youtube.com/watch?v=abc123"}},
 		},
-		isPlaying:            true,
-		autoplayEnabled:      true,
-		lastPlayed:           Track{URL: "https://www.youtube.com/watch?v=def456"},
-		lastVoiceChannelID:   "voice",
+		isPlaying:          true,
+		autoplayEnabled:    true,
+		lastPlayed:         Track{URL: "https://www.youtube.com/watch?v=def456"},
+		lastVoiceChannelID: "voice",
+		playedVideoIDs: map[string]struct{}{
+			"abc123": {},
+			"def456": {},
+		},
 		disconnectTimer:      time.AfterFunc(time.Hour, func() {}),
 		nowPlayingChannelID:  "text",
 		nowPlayingMessageID:  "message",
@@ -43,6 +47,9 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	}
 	if gs.lastVoiceChannelID != "" {
 		t.Fatalf("lastVoiceChannelID = %q, want empty", gs.lastVoiceChannelID)
+	}
+	if len(gs.playedVideoIDs) != 0 {
+		t.Fatalf("playedVideoIDs length = %d, want 0", len(gs.playedVideoIDs))
 	}
 	if gs.disconnectTimer != nil {
 		t.Fatal("disconnectTimer was not cleared")
@@ -676,7 +683,7 @@ func TestChooseAutoplayTrackUsesRadioOrder(t *testing.T) {
 		{VideoID: "second", Title: "Different Song", Artist: "Another Artist", Duration: "3:10"},
 	}
 
-	track, err := chooseAutoplayTrack(results, "seed")
+	track, err := chooseAutoplayTrack(results, "seed", nil)
 	if err != nil {
 		t.Fatalf("chooseAutoplayTrack() error = %v, want nil", err)
 	}
@@ -691,7 +698,7 @@ func TestChooseAutoplayTrackSkipsResultsWithoutVideoID(t *testing.T) {
 		{VideoID: "playable", Title: "Playable Song", Artist: "Artist", Duration: "3:10"},
 	}
 
-	track, err := chooseAutoplayTrack(results, "seed")
+	track, err := chooseAutoplayTrack(results, "seed", nil)
 	if err != nil {
 		t.Fatalf("chooseAutoplayTrack() error = %v, want nil", err)
 	}
@@ -705,9 +712,26 @@ func TestChooseAutoplayTrackReturnsErrorWithoutPlayableResults(t *testing.T) {
 		{VideoID: "seed", Title: "Current Song"},
 		{Title: "Unavailable Song"},
 	}
-	_, err := chooseAutoplayTrack(results, "seed")
+	_, err := chooseAutoplayTrack(results, "seed", nil)
 	if err == nil {
 		t.Fatal("chooseAutoplayTrack() error = nil, want error")
+	}
+}
+
+func TestChooseAutoplayTrackSkipsTracksPlayedThisSession(t *testing.T) {
+	results := []SearchResult{
+		{VideoID: "seed", Title: "Current Song"},
+		{VideoID: "played", Title: "Already Played"},
+		{VideoID: "next", Title: "Next Song"},
+	}
+	playedVideoIDs := map[string]struct{}{"played": {}}
+
+	track, err := chooseAutoplayTrack(results, "seed", playedVideoIDs)
+	if err != nil {
+		t.Fatalf("chooseAutoplayTrack() error = %v, want nil", err)
+	}
+	if got := trackVideoID(track); got != "next" {
+		t.Fatalf("chosen video ID = %q, want next", got)
 	}
 }
 

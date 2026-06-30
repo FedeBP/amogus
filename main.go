@@ -167,6 +167,7 @@ type guildState struct {
 	autoplayEnabled      bool
 	lastPlayed           Track
 	lastVoiceChannelID   string
+	playedVideoIDs       map[string]struct{}
 	disconnectTimer      *time.Timer
 	activeDlCmd          *exec.Cmd
 	activeFfCmd          *exec.Cmd
@@ -345,6 +346,7 @@ func parseNowPlayingCustomID(customID string) (string, string, bool) {
 type autoplaySkipRequest struct {
 	seed           Track
 	voiceChannelID string
+	playedVideoIDs map[string]struct{}
 }
 
 func (gs *guildState) prepareSkip() (autoplaySkipRequest, bool) {
@@ -359,6 +361,7 @@ func (gs *guildState) prepareSkip() (autoplaySkipRequest, bool) {
 		req = autoplaySkipRequest{
 			seed:           gs.lastPlayed,
 			voiceChannelID: gs.lastVoiceChannelID,
+			playedVideoIDs: gs.playedVideoIDsLocked(),
 		}
 	}
 	gs.mu.Unlock()
@@ -392,6 +395,7 @@ func (gs *guildState) resetPlaybackState() {
 	gs.autoplayEnabled = false
 	gs.lastPlayed = Track{}
 	gs.lastVoiceChannelID = ""
+	gs.playedVideoIDs = nil
 	gs.clearNowPlayingControlsLocked()
 	if gs.disconnectTimer != nil {
 		gs.disconnectTimer.Stop()
@@ -1053,6 +1057,29 @@ func trackFromSearchResult(r SearchResult) Track {
 	}
 }
 
+// playedVideoIDsLocked returns a snapshot of tracks played in the current
+// voice session. The caller must hold gs.mu.
+func (gs *guildState) playedVideoIDsLocked() map[string]struct{} {
+	played := make(map[string]struct{}, len(gs.playedVideoIDs))
+	for id := range gs.playedVideoIDs {
+		played[id] = struct{}{}
+	}
+	return played
+}
+
+// rememberPlayedTrackLocked records an exact video ID for the current session.
+// The caller must hold gs.mu.
+func (gs *guildState) rememberPlayedTrackLocked(track Track) {
+	id := trackVideoID(track)
+	if id == "" {
+		return
+	}
+	if gs.playedVideoIDs == nil {
+		gs.playedVideoIDs = make(map[string]struct{})
+	}
+	gs.playedVideoIDs[id] = struct{}{}
+}
+
 // ytDownloaderPath returns the absolute path of yt-dlp (preferred) or
 // youtube-dl, whichever is found first on PATH.
 func ytDownloaderPath() (string, error) {
@@ -1279,9 +1306,12 @@ func ytMusicRadio(ctx context.Context, videoID string) ([]SearchResult, error) {
 	return results, nil
 }
 
-func chooseAutoplayTrack(results []SearchResult, seedID string) (Track, error) {
+func chooseAutoplayTrack(results []SearchResult, seedID string, playedVideoIDs map[string]struct{}) (Track, error) {
 	for _, r := range results {
 		if r.VideoID == "" || r.VideoID == seedID {
+			continue
+		}
+		if _, played := playedVideoIDs[r.VideoID]; played {
 			continue
 		}
 		return trackFromSearchResult(r), nil
@@ -1289,7 +1319,7 @@ func chooseAutoplayTrack(results []SearchResult, seedID string) (Track, error) {
 	return Track{}, errors.New("no radio suggestions found")
 }
 
-func resolveAutoplayTrack(ctx context.Context, seed Track) (Track, error) {
+func resolveAutoplayTrack(ctx context.Context, seed Track, playedVideoIDs map[string]struct{}) (Track, error) {
 	seedID := trackVideoID(seed)
 	if seedID == "" {
 		return Track{}, errors.New("last track has no YouTube video ID")
@@ -1299,7 +1329,7 @@ func resolveAutoplayTrack(ctx context.Context, seed Track) (Track, error) {
 	if err != nil {
 		return Track{}, err
 	}
-	return chooseAutoplayTrack(results, seedID)
+	return chooseAutoplayTrack(results, seedID, playedVideoIDs)
 }
 
 // youtubeAutocompleteChoices returns Discord autocomplete choices for the
@@ -1499,10 +1529,11 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 				clearNowPlayingMessageComponents(s, controls)
 				return
 			}
+			playedVideoIDs := gs.playedVideoIDsLocked()
 			gs.mu.Unlock()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			nextTrack, err := resolveAutoplayTrack(ctx, seed)
+			nextTrack, err := resolveAutoplayTrack(ctx, seed, playedVideoIDs)
 			cancel()
 			if err != nil {
 				log.Printf("autoplay: %v", err)
@@ -1542,6 +1573,7 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 		gs.songQueue = gs.songQueue[1:]
 		gs.lastPlayed = song.track
 		gs.lastVoiceChannelID = song.channelID
+		gs.rememberPlayedTrackLocked(song.track)
 		if gs.disconnectTimer != nil {
 			gs.disconnectTimer.Stop()
 			gs.disconnectTimer = nil
@@ -2414,7 +2446,7 @@ func skipPlayback(s *discordgo.Session, guildID, textChannelID string, gs *guild
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	nextTrack, err := resolveAutoplayTrack(ctx, req.seed)
+	nextTrack, err := resolveAutoplayTrack(ctx, req.seed, req.playedVideoIDs)
 	cancel()
 	if err != nil {
 		log.Printf("skip autoplay: %v", err)
