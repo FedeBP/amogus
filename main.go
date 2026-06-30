@@ -30,7 +30,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"google.golang.org/api/option"
@@ -168,8 +167,6 @@ type guildState struct {
 	autoplayEnabled      bool
 	lastPlayed           Track
 	lastVoiceChannelID   string
-	recentVideoIDs       []string
-	recentTracks         []Track
 	disconnectTimer      *time.Timer
 	activeDlCmd          *exec.Cmd
 	activeFfCmd          *exec.Cmd
@@ -348,8 +345,6 @@ func parseNowPlayingCustomID(customID string) (string, string, bool) {
 type autoplaySkipRequest struct {
 	seed           Track
 	voiceChannelID string
-	excluded       map[string]struct{}
-	history        []Track
 }
 
 func (gs *guildState) prepareSkip() (autoplaySkipRequest, bool) {
@@ -364,8 +359,6 @@ func (gs *guildState) prepareSkip() (autoplaySkipRequest, bool) {
 		req = autoplaySkipRequest{
 			seed:           gs.lastPlayed,
 			voiceChannelID: gs.lastVoiceChannelID,
-			excluded:       gs.autoplayExclusionsLocked(),
-			history:        gs.autoplayHistoryLocked(),
 		}
 	}
 	gs.mu.Unlock()
@@ -399,8 +392,6 @@ func (gs *guildState) resetPlaybackState() {
 	gs.autoplayEnabled = false
 	gs.lastPlayed = Track{}
 	gs.lastVoiceChannelID = ""
-	gs.recentVideoIDs = nil
-	gs.recentTracks = nil
 	gs.clearNowPlayingControlsLocked()
 	if gs.disconnectTimer != nil {
 		gs.disconnectTimer.Stop()
@@ -443,23 +434,20 @@ var (
 )
 
 const (
-	maxPlaylistTracks      = 200
-	discordChoiceNameMax   = 100
-	autoplayCandidateLimit = 50
-	recentVideoMemory      = 50
-	recentTrackMemory      = 20
-	queuePageSize          = 10
-	queueLineMaxLen        = 120
-	discordFieldValueMax   = 1024
-	guildActionQueueSize   = 64
-	defaultMaxStreams      = 5
-	searchCacheMaxEntries  = 256
-	trackCacheMaxEntries   = 2048
-	searchCacheTTL         = 10 * time.Minute
-	idleDisconnectTimeout  = 5 * time.Minute
-	opusSendTimeout        = 2 * time.Second
-	opusSendPollInterval   = 20 * time.Millisecond
-	processOutputTailMax   = 2000
+	maxPlaylistTracks     = 200
+	discordChoiceNameMax  = 100
+	queuePageSize         = 10
+	queueLineMaxLen       = 120
+	discordFieldValueMax  = 1024
+	guildActionQueueSize  = 64
+	defaultMaxStreams     = 5
+	searchCacheMaxEntries = 256
+	trackCacheMaxEntries  = 2048
+	searchCacheTTL        = 10 * time.Minute
+	idleDisconnectTimeout = 5 * time.Minute
+	opusSendTimeout       = 2 * time.Second
+	opusSendPollInterval  = 20 * time.Millisecond
+	processOutputTailMax  = 2000
 )
 
 const (
@@ -1065,205 +1053,6 @@ func trackFromSearchResult(r SearchResult) Track {
 	}
 }
 
-func trackHasAutoplayIdentity(t Track) bool {
-	return trackVideoID(t) != "" || normalizedAutoplayTitle(t.Title) != "" || normalizedAutoplayArtist(t.Artist) != ""
-}
-
-func sameAutoplayIdentity(a, b Track) bool {
-	aID, bID := trackVideoID(a), trackVideoID(b)
-	if aID != "" && bID != "" {
-		return aID == bID
-	}
-	aTitle, bTitle := normalizedAutoplayTitle(a.Title), normalizedAutoplayTitle(b.Title)
-	aArtist, bArtist := normalizedAutoplayArtist(a.Artist), normalizedAutoplayArtist(b.Artist)
-	return aTitle != "" && aTitle == bTitle && aArtist != "" && aArtist == bArtist
-}
-
-// rememberTrackLocked records recently played tracks so autoplay does not
-// immediately loop the same few recommendations. The caller must hold gs.mu.
-func (gs *guildState) rememberTrackLocked(t Track) {
-	id := trackVideoID(t)
-	if id != "" {
-		if len(gs.recentVideoIDs) == 0 || gs.recentVideoIDs[len(gs.recentVideoIDs)-1] != id {
-			gs.recentVideoIDs = append(gs.recentVideoIDs, id)
-			if len(gs.recentVideoIDs) > recentVideoMemory {
-				gs.recentVideoIDs = gs.recentVideoIDs[len(gs.recentVideoIDs)-recentVideoMemory:]
-			}
-		}
-	}
-	if !trackHasAutoplayIdentity(t) {
-		return
-	}
-	if len(gs.recentTracks) > 0 && sameAutoplayIdentity(gs.recentTracks[len(gs.recentTracks)-1], t) {
-		return
-	}
-	gs.recentTracks = append(gs.recentTracks, t)
-	if len(gs.recentTracks) > recentTrackMemory {
-		gs.recentTracks = gs.recentTracks[len(gs.recentTracks)-recentTrackMemory:]
-	}
-}
-
-// autoplayExclusionsLocked returns video IDs already played recently or queued.
-// The caller must hold gs.mu.
-func (gs *guildState) autoplayExclusionsLocked() map[string]struct{} {
-	excluded := make(map[string]struct{}, len(gs.recentVideoIDs)+len(gs.songQueue)+1)
-	for _, id := range gs.recentVideoIDs {
-		if id != "" {
-			excluded[id] = struct{}{}
-		}
-	}
-	if id := trackVideoID(gs.lastPlayed); id != "" {
-		excluded[id] = struct{}{}
-	}
-	for _, song := range gs.songQueue {
-		if id := trackVideoID(song.track); id != "" {
-			excluded[id] = struct{}{}
-		}
-	}
-	return excluded
-}
-
-func (gs *guildState) autoplayHistoryLocked() []Track {
-	history := make([]Track, 0, len(gs.recentTracks)+len(gs.songQueue)+1)
-	history = append(history, gs.recentTracks...)
-	if trackHasAutoplayIdentity(gs.lastPlayed) {
-		history = append(history, gs.lastPlayed)
-	}
-	for _, song := range gs.songQueue {
-		if trackHasAutoplayIdentity(song.track) {
-			history = append(history, song.track)
-		}
-	}
-	return history
-}
-
-func normalizedAutoplayArtist(s string) string {
-	return strings.Join(autoplayTextTokens(s, false), " ")
-}
-
-func normalizedAutoplayTitle(s string) string {
-	return strings.Join(autoplayTextTokens(s, true), " ")
-}
-
-func autoplayTextTokens(s string, dropNoise bool) []string {
-	s = strings.ToLower(stripBracketedText(s))
-	var b strings.Builder
-	for _, r := range s {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			b.WriteRune(r)
-			continue
-		}
-		b.WriteByte(' ')
-	}
-	raw := strings.Fields(b.String())
-	tokens := make([]string, 0, len(raw))
-	for _, token := range raw {
-		if dropNoise && isAutoplayTitleNoise(token) {
-			continue
-		}
-		tokens = append(tokens, token)
-	}
-	return tokens
-}
-
-func stripBracketedText(s string) string {
-	var b strings.Builder
-	depth := 0
-	for _, r := range s {
-		switch r {
-		case '(', '[', '{':
-			depth++
-		case ')', ']', '}':
-			if depth > 0 {
-				depth--
-			}
-		default:
-			if depth == 0 {
-				b.WriteRune(r)
-			}
-		}
-	}
-	return b.String()
-}
-
-func isAutoplayTitleNoise(token string) bool {
-	switch token {
-	case "official", "audio", "video", "music", "lyrics", "lyric", "visualizer",
-		"remaster", "remastered", "live", "explicit", "clean", "hd", "hq",
-		"feat", "ft", "featuring", "version", "edit", "single", "album":
-		return true
-	default:
-		return false
-	}
-}
-
-func autoplayTitleSimilar(a, b string) bool {
-	aTokens := strings.Fields(normalizedAutoplayTitle(a))
-	bTokens := strings.Fields(normalizedAutoplayTitle(b))
-	if len(aTokens) == 0 || len(bTokens) == 0 {
-		return false
-	}
-	common := 0
-	seen := make(map[string]struct{}, len(aTokens))
-	for _, token := range aTokens {
-		seen[token] = struct{}{}
-	}
-	for _, token := range bTokens {
-		if _, ok := seen[token]; ok {
-			common++
-		}
-	}
-	minLen, maxLen := len(aTokens), len(bTokens)
-	if minLen > maxLen {
-		minLen, maxLen = maxLen, minLen
-	}
-	if common == minLen && minLen >= 2 {
-		return true
-	}
-	return common >= 2 && float64(common)/float64(maxLen) >= 0.67
-}
-
-func autoplayNearDuplicate(candidate Track, history []Track) bool {
-	candidateArtist := normalizedAutoplayArtist(candidate.Artist)
-	for _, previous := range history {
-		if sameAutoplayIdentity(candidate, previous) {
-			return true
-		}
-		previousArtist := normalizedAutoplayArtist(previous.Artist)
-		sameKnownArtist := candidateArtist != "" && candidateArtist == previousArtist
-		if sameKnownArtist && autoplayTitleSimilar(candidate.Title, previous.Title) {
-			return true
-		}
-		if candidateArtist == "" && previousArtist == "" && autoplayTitleSimilar(candidate.Title, previous.Title) {
-			return true
-		}
-	}
-	return false
-}
-
-func autoplayCandidateScore(candidate Track, history []Track, position int) int {
-	score := 1000 - position
-	candidateArtist := normalizedAutoplayArtist(candidate.Artist)
-	for i := len(history) - 1; i >= 0; i-- {
-		previous := history[i]
-		recencyPenalty := len(history) - i
-		previousArtist := normalizedAutoplayArtist(previous.Artist)
-		if candidateArtist != "" && candidateArtist == previousArtist {
-			score -= 15
-			if recencyPenalty <= 3 {
-				score -= 25
-			}
-		}
-		if autoplayTitleSimilar(candidate.Title, previous.Title) {
-			score -= 50
-			if recencyPenalty <= 5 {
-				score -= 80
-			}
-		}
-	}
-	return score
-}
-
 // ytDownloaderPath returns the absolute path of yt-dlp (preferred) or
 // youtube-dl, whichever is found first on PATH.
 func ytDownloaderPath() (string, error) {
@@ -1456,7 +1245,7 @@ func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 
 // ytMusicRadio asks the Python sidecar for YouTube Music radio suggestions
 // based on a seed video ID.
-func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResult, error) {
+func ytMusicRadio(ctx context.Context, videoID string) ([]SearchResult, error) {
 	videoID = strings.TrimSpace(videoID)
 	if videoID == "" {
 		return nil, errors.New("empty seed video ID")
@@ -1464,7 +1253,6 @@ func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResul
 
 	params := url.Values{}
 	params.Set("videoId", videoID)
-	params.Set("limit", fmt.Sprint(limit))
 
 	reqURL := "http://127.0.0.1:5000/radio?" + params.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -1491,44 +1279,27 @@ func ytMusicRadio(ctx context.Context, videoID string, limit int) ([]SearchResul
 	return results, nil
 }
 
-func chooseAutoplayTrack(results []SearchResult, excluded map[string]struct{}, history []Track) (Track, error) {
-	var best Track
-	bestScore := -1 << 30
-
-	for i, r := range results {
-		if r.VideoID == "" {
+func chooseAutoplayTrack(results []SearchResult, seedID string) (Track, error) {
+	for _, r := range results {
+		if r.VideoID == "" || r.VideoID == seedID {
 			continue
 		}
-		if _, seen := excluded[r.VideoID]; seen {
-			continue
-		}
-		track := trackFromSearchResult(r)
-		score := autoplayCandidateScore(track, history, i)
-		if autoplayNearDuplicate(track, history) {
-			continue
-		}
-		if score > bestScore {
-			best = track
-			bestScore = score
-		}
+		return trackFromSearchResult(r), nil
 	}
-	if best.URL != "" {
-		return best, nil
-	}
-	return Track{}, errors.New("no fresh radio suggestions found")
+	return Track{}, errors.New("no radio suggestions found")
 }
 
-func resolveAutoplayTrack(ctx context.Context, seed Track, excluded map[string]struct{}, history []Track) (Track, error) {
+func resolveAutoplayTrack(ctx context.Context, seed Track) (Track, error) {
 	seedID := trackVideoID(seed)
 	if seedID == "" {
 		return Track{}, errors.New("last track has no YouTube video ID")
 	}
 
-	results, err := ytMusicRadio(ctx, seedID, autoplayCandidateLimit)
+	results, err := ytMusicRadio(ctx, seedID)
 	if err != nil {
 		return Track{}, err
 	}
-	return chooseAutoplayTrack(results, excluded, history)
+	return chooseAutoplayTrack(results, seedID)
 }
 
 // youtubeAutocompleteChoices returns Discord autocomplete choices for the
@@ -1728,12 +1499,10 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 				clearNowPlayingMessageComponents(s, controls)
 				return
 			}
-			excluded := gs.autoplayExclusionsLocked()
-			history := gs.autoplayHistoryLocked()
 			gs.mu.Unlock()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			nextTrack, err := resolveAutoplayTrack(ctx, seed, excluded, history)
+			nextTrack, err := resolveAutoplayTrack(ctx, seed)
 			cancel()
 			if err != nil {
 				log.Printf("autoplay: %v", err)
@@ -1773,7 +1542,6 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 		gs.songQueue = gs.songQueue[1:]
 		gs.lastPlayed = song.track
 		gs.lastVoiceChannelID = song.channelID
-		gs.rememberTrackLocked(song.track)
 		if gs.disconnectTimer != nil {
 			gs.disconnectTimer.Stop()
 			gs.disconnectTimer = nil
@@ -2646,7 +2414,7 @@ func skipPlayback(s *discordgo.Session, guildID, textChannelID string, gs *guild
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	nextTrack, err := resolveAutoplayTrack(ctx, req.seed, req.excluded, req.history)
+	nextTrack, err := resolveAutoplayTrack(ctx, req.seed)
 	cancel()
 	if err != nil {
 		log.Printf("skip autoplay: %v", err)

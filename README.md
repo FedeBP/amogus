@@ -32,7 +32,7 @@ The latest Now Playing message includes buttons for skip, stop, queue, and autop
 
 Autoplay is per server and lasts only for the current voice session. It resets when the bot is stopped, disconnected, or kicked from voice.
 
-When autoplay is enabled and the queue runs out, the bot asks the YouTube Music sidecar for related tracks. It keeps recent track history so it can avoid exact repeats and near-duplicate title/artist loops.
+When autoplay is enabled and the queue runs out, the bot asks the YouTube Music sidecar for related tracks and follows the order returned by YouTube Music.
 
 ## Queue Tips
 

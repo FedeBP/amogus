@@ -16,14 +16,10 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 		songQueue: []Song{
 			{guildID: "guild", channelID: "voice", track: Track{URL: "https://www.youtube.com/watch?v=abc123"}},
 		},
-		isPlaying:          true,
-		autoplayEnabled:    true,
-		lastPlayed:         Track{URL: "https://www.youtube.com/watch?v=def456"},
-		lastVoiceChannelID: "voice",
-		recentVideoIDs:     []string{"abc123", "def456"},
-		recentTracks: []Track{
-			{URL: "https://www.youtube.com/watch?v=abc123", Title: "Victory Lap Five", Artist: "Fred again.."},
-		},
+		isPlaying:            true,
+		autoplayEnabled:      true,
+		lastPlayed:           Track{URL: "https://www.youtube.com/watch?v=def456"},
+		lastVoiceChannelID:   "voice",
 		disconnectTimer:      time.AfterFunc(time.Hour, func() {}),
 		nowPlayingChannelID:  "text",
 		nowPlayingMessageID:  "message",
@@ -47,12 +43,6 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	}
 	if gs.lastVoiceChannelID != "" {
 		t.Fatalf("lastVoiceChannelID = %q, want empty", gs.lastVoiceChannelID)
-	}
-	if len(gs.recentVideoIDs) != 0 {
-		t.Fatalf("recentVideoIDs length = %d, want 0", len(gs.recentVideoIDs))
-	}
-	if len(gs.recentTracks) != 0 {
-		t.Fatalf("recentTracks length = %d, want 0", len(gs.recentTracks))
 	}
 	if gs.disconnectTimer != nil {
 		t.Fatal("disconnectTimer was not cleared")
@@ -679,96 +669,45 @@ func TestStopAfterAutoplayErrorKeepsLoopAliveForQueuedTrack(t *testing.T) {
 	}
 }
 
-func TestAutoplayNearDuplicateCatchesTitleVariants(t *testing.T) {
-	history := []Track{
-		{URL: "https://www.youtube.com/watch?v=abc123", Title: "Victory Lap Five", Artist: "Fred again.."},
-	}
-	candidate := Track{
-		URL:    "https://www.youtube.com/watch?v=def456",
-		Title:  "Victory Lap",
-		Artist: "Fred again..",
-	}
-
-	if !autoplayNearDuplicate(candidate, history) {
-		t.Fatal("autoplayNearDuplicate() = false, want true for same-artist title variant")
-	}
-}
-
-func TestAutoplayNearDuplicateIgnoresCommonTitleFromDifferentArtist(t *testing.T) {
-	history := []Track{
-		{URL: "https://www.youtube.com/watch?v=abc123", Title: "Home", Artist: "Artist A"},
-	}
-	candidate := Track{
-		URL:    "https://www.youtube.com/watch?v=def456",
-		Title:  "Home",
-		Artist: "Artist B",
-	}
-
-	if autoplayNearDuplicate(candidate, history) {
-		t.Fatal("autoplayNearDuplicate() = true, want false for different-artist common title")
-	}
-}
-
-func TestChooseAutoplayTrackPrefersFreshCandidate(t *testing.T) {
-	history := []Track{
-		{URL: "https://www.youtube.com/watch?v=abc123", Title: "Victory Lap Five", Artist: "Fred again.."},
-	}
+func TestChooseAutoplayTrackUsesRadioOrder(t *testing.T) {
 	results := []SearchResult{
-		{VideoID: "duplicate", Title: "Victory Lap", Artist: "Fred again..", Duration: "2:46"},
-		{VideoID: "fresh", Title: "Different Song", Artist: "Another Artist", Duration: "3:10"},
+		{VideoID: "seed", Title: "Current Song", Artist: "Artist", Duration: "2:40"},
+		{VideoID: "first", Title: "Song (Live Remastered Version)", Artist: "Artist", Duration: "2:46"},
+		{VideoID: "second", Title: "Different Song", Artist: "Another Artist", Duration: "3:10"},
 	}
 
-	track, err := chooseAutoplayTrack(results, nil, history)
+	track, err := chooseAutoplayTrack(results, "seed")
 	if err != nil {
 		t.Fatalf("chooseAutoplayTrack() error = %v, want nil", err)
 	}
-	if got := trackVideoID(track); got != "fresh" {
-		t.Fatalf("chosen video ID = %q, want fresh", got)
+	if got := trackVideoID(track); got != "first" {
+		t.Fatalf("chosen video ID = %q, want first", got)
 	}
 }
 
-func TestChooseAutoplayTrackKeepsExcludedVideosBlocked(t *testing.T) {
+func TestChooseAutoplayTrackSkipsResultsWithoutVideoID(t *testing.T) {
 	results := []SearchResult{
-		{VideoID: "blocked", Title: "Blocked Song", Artist: "Artist", Duration: "2:46"},
+		{Title: "Unavailable Song", Artist: "Artist", Duration: "2:46"},
+		{VideoID: "playable", Title: "Playable Song", Artist: "Artist", Duration: "3:10"},
 	}
 
-	_, err := chooseAutoplayTrack(results, map[string]struct{}{"blocked": {}}, nil)
-	if err == nil {
-		t.Fatal("chooseAutoplayTrack() error = nil, want error when all results are excluded")
+	track, err := chooseAutoplayTrack(results, "seed")
+	if err != nil {
+		t.Fatalf("chooseAutoplayTrack() error = %v, want nil", err)
+	}
+	if got := trackVideoID(track); got != "playable" {
+		t.Fatalf("chosen video ID = %q, want playable", got)
 	}
 }
 
-func TestChooseAutoplayTrackRejectsOnlyNearDuplicates(t *testing.T) {
-	history := []Track{
-		{URL: "https://www.youtube.com/watch?v=abc123", Title: "Victory Lap Five", Artist: "Fred again.."},
-	}
+func TestChooseAutoplayTrackReturnsErrorWithoutPlayableResults(t *testing.T) {
 	results := []SearchResult{
-		{VideoID: "duplicate", Title: "Victory Lap", Artist: "Fred again..", Duration: "2:46"},
+		{VideoID: "seed", Title: "Current Song"},
+		{Title: "Unavailable Song"},
 	}
-
-	_, err := chooseAutoplayTrack(results, nil, history)
+	_, err := chooseAutoplayTrack(results, "seed")
 	if err == nil {
-		t.Fatal("chooseAutoplayTrack() error = nil, want error when only near-duplicates are available")
-	}
-}
-
-func TestRememberTrackLockedKeepsRecentTrackMetadata(t *testing.T) {
-	gs := &guildState{}
-
-	gs.rememberTrackLocked(Track{
-		URL:    "https://www.youtube.com/watch?v=abc123",
-		Title:  "Victory Lap Five",
-		Artist: "Fred again..",
-	})
-
-	if len(gs.recentVideoIDs) != 1 {
-		t.Fatalf("recentVideoIDs length = %d, want 1", len(gs.recentVideoIDs))
-	}
-	if len(gs.recentTracks) != 1 {
-		t.Fatalf("recentTracks length = %d, want 1", len(gs.recentTracks))
-	}
-	if got := normalizedAutoplayTitle(gs.recentTracks[0].Title); got != "victory lap five" {
-		t.Fatalf("normalized recent title = %q, want %q", got, "victory lap five")
+		t.Fatal("chooseAutoplayTrack() error = nil, want error")
 	}
 }
 
