@@ -1,0 +1,4 @@
+flask
+waitress
+yt-dlp[default]
+ytmusicapi>=1.12.2

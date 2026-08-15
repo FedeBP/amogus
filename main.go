@@ -2225,6 +2225,10 @@ func ytdlpCommandArgs(pipeline audioPipeline, youtubeURL string) []string {
 	return []string{
 		"--no-playlist",
 		"--no-progress",
+		"--no-update",
+		"--remote-components", "ejs:github",
+		// Avoid YouTube clients that intermittently return HTTP 403 media URLs.
+		"--extractor-args", "youtube:player_client=default,web_embedded,-android_vr,-android_sdkless;player_js_version=actual",
 		"-f", pipeline.ytdlpFormat,
 		"-o", "-",
 		youtubeURL,

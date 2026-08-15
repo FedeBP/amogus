@@ -434,6 +434,15 @@ func TestYtdlpCommandArgsDisableProgress(t *testing.T) {
 	if !strings.Contains(args, "--no-progress") {
 		t.Fatalf("yt-dlp args = %q, want --no-progress", args)
 	}
+	if !strings.Contains(args, "--no-update") {
+		t.Fatalf("yt-dlp args = %q, want --no-update", args)
+	}
+	if !strings.Contains(args, "--remote-components ejs:github") {
+		t.Fatalf("yt-dlp args = %q, want EJS remote component fallback", args)
+	}
+	if !strings.Contains(args, `--extractor-args youtube:player_client=default,web_embedded,-android_vr,-android_sdkless;player_js_version=actual`) {
+		t.Fatalf("yt-dlp args = %q, want youtube player_client workaround", args)
+	}
 	if !strings.Contains(args, "-f bestaudio[acodec=opus]") {
 		t.Fatalf("yt-dlp args = %q, want copy pipeline format", args)
 	}

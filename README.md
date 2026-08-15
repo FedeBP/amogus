@@ -57,8 +57,8 @@ When autoplay is enabled and the queue runs out, the bot asks the YouTube Music 
 |-------------|-------|
 | Go 1.22+ | Matches `go.mod`. |
 | Python 3 | Runs the local YTMusic search/radio sidecar. |
-| Python packages | `flask`, `waitress`, and `ytmusicapi`. |
-| yt-dlp | Downloads/extracts source audio. `youtube-dl` is accepted as a fallback. |
+| Python packages | `flask`, `waitress`, `yt-dlp[default]`, and `ytmusicapi>=1.12.2` (see `requirements.txt`). |
+| yt-dlp | Downloads/extracts source audio. `youtube-dl` is accepted as a fallback. Keep it current; YouTube breaks old extractors often. |
 | ffmpeg | Must include `libopus`, which normal package-manager builds do. |
 | Discord bot token | From the Discord Developer Portal. |
 | YouTube Data API v3 key | Used for playlist expansion. Search/radio uses the YTMusic sidecar. |
@@ -109,7 +109,15 @@ Some Discord voice regions require E2EE/DAVE. This repo still uses a `replace` i
 Install the Python sidecar dependencies once:
 
 ```powershell
-python -m pip install flask waitress ytmusicapi
+python -m pip install -r requirements.txt
+```
+
+On Windows, the bot runs whatever `yt-dlp` is first on `PATH` (often a WinGet `yt-dlp.exe`), not the copy installed by `pip`. After upgrading Python packages, also update the standalone binary:
+
+```powershell
+yt-dlp --version
+yt-dlp -U
+deno --version
 ```
 
 Run a clean local session:
@@ -168,7 +176,9 @@ Reasonable options:
 | Problem | Things to check |
 |---------|-----------------|
 | `yt-dlp` / `ffmpeg` not found | Install both and confirm `yt-dlp --version` and `ffmpeg -version`. |
-| No search/autocomplete/autoplay suggestions | Confirm `python search.py` is running on `127.0.0.1:5000` and that `flask`, `waitress`, and `ytmusicapi` are installed. |
+| `HTTP Error 403` / `opus_copy` fallback in logs | Update the `yt-dlp` binary on `PATH` (`yt-dlp -U` or `winget upgrade yt-dlp`), reinstall `python -m pip install -r requirements.txt`, and confirm `deno --version` works. On Windows, `pip install yt-dlp` does not replace WinGet's `yt-dlp.exe`. The bot also passes `--remote-components ejs:github` and `--extractor-args "youtube:player_client=default,web_embedded,-android_vr,-android_sdkless;player_js_version=actual"` to avoid broken YouTube clients and stale player URLs. |
+| No search/autocomplete/autoplay suggestions | Confirm `python search.py` is running on `127.0.0.1:5000` and run `python -m pip install -r requirements.txt`. |
+| Autoplay radio `KeyError: 'endpoint'` in `search.py` logs | Upgrade `ytmusicapi` to `>=1.12.2` via `requirements.txt`, then restart the sidecar. |
 | Playlist errors | Use the full YouTube URL including `list=...`; the API key must have YouTube Data API v3 enabled and quota available. |
 | Voice 4017 / DAVE errors | Keep the `discordgo` replace in `go.mod` until upstream DAVE support is available. |
 | Slash commands do not appear | Restart the bot so it bulk-overwrites commands, then refresh Discord with `Ctrl+R`. |

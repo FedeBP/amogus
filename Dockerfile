@@ -21,6 +21,10 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 
+COPY --from=denoland/deno:bin-2.7.14 /deno /usr/local/bin/deno
+
+COPY requirements.txt .
+
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends \
 		ca-certificates \
@@ -29,10 +33,7 @@ RUN apt-get update \
 		python3-venv \
 	&& python3 -m venv /opt/search-venv \
 	&& /opt/search-venv/bin/pip install --no-cache-dir \
-		flask \
-		waitress \
-		yt-dlp \
-		ytmusicapi \
+		-r requirements.txt \
 	&& rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/opt/search-venv/bin:${PATH}"
