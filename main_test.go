@@ -59,6 +59,80 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	}
 }
 
+func TestPrepareUnexpectedVoiceLeaveRecoveryRequeuesCurrentTrack(t *testing.T) {
+	gs := &guildState{
+		songQueue: []Song{
+			{guildID: "guild", channelID: "voice", track: Track{URL: "https://www.youtube.com/watch?v=next"}},
+		},
+		isPlaying:           true,
+		lastPlayed:          Track{URL: "https://www.youtube.com/watch?v=current", Title: "Current"},
+		lastVoiceChannelID:  "voice",
+		disconnectTimer:     time.AfterFunc(time.Hour, func() {}),
+		nowPlayingChannelID: "text",
+		nowPlayingMessageID: "message",
+		nowPlayingControlID: "control",
+	}
+	oldGeneration := gs.playbackGeneration.Load()
+
+	recovery, ok := gs.prepareUnexpectedVoiceLeaveRecovery("guild")
+
+	if !ok {
+		t.Fatal("prepareUnexpectedVoiceLeaveRecovery() ok = false, want true")
+	}
+	if recovery.textChannelID != "text" {
+		t.Fatalf("textChannelID = %q, want text", recovery.textChannelID)
+	}
+	if recovery.controls.channelID != "text" || recovery.controls.messageID != "message" {
+		t.Fatalf("controls = %#v, want text/message", recovery.controls)
+	}
+	if recovery.generation == oldGeneration || gs.playbackGeneration.Load() == oldGeneration {
+		t.Fatal("playbackGeneration did not change")
+	}
+	if len(gs.songQueue) != 2 {
+		t.Fatalf("songQueue length = %d, want 2", len(gs.songQueue))
+	}
+	if gs.songQueue[0].track.URL != "https://www.youtube.com/watch?v=current" {
+		t.Fatalf("first queued URL = %q, want current track", gs.songQueue[0].track.URL)
+	}
+	if gs.songQueue[1].track.URL != "https://www.youtube.com/watch?v=next" {
+		t.Fatalf("second queued URL = %q, want next track", gs.songQueue[1].track.URL)
+	}
+	if !gs.isPlaying {
+		t.Fatal("isPlaying = false, want true")
+	}
+	if gs.disconnectTimer != nil {
+		t.Fatal("disconnectTimer was not cleared")
+	}
+	if gs.nowPlayingChannelID != "" || gs.nowPlayingMessageID != "" || gs.nowPlayingControlID != "" {
+		t.Fatalf("now playing controls = %q/%q/%q, want cleared", gs.nowPlayingChannelID, gs.nowPlayingMessageID, gs.nowPlayingControlID)
+	}
+}
+
+func TestPrepareUnexpectedVoiceLeaveRecoveryRequiresActiveTrack(t *testing.T) {
+	gs := &guildState{isPlaying: true, lastVoiceChannelID: "voice", nowPlayingChannelID: "text"}
+
+	if _, ok := gs.prepareUnexpectedVoiceLeaveRecovery("guild"); ok {
+		t.Fatal("prepareUnexpectedVoiceLeaveRecovery() ok = true, want false without current track URL")
+	}
+}
+
+func TestCloseLocalVoiceConnectionClearsChannelAndSessionEntry(t *testing.T) {
+	vc := &discordgo.VoiceConnection{GuildID: "guild", ChannelID: "voice"}
+	s := &discordgo.Session{VoiceConnections: map[string]*discordgo.VoiceConnection{"guild": vc}}
+
+	closeLocalVoiceConnection(s, "guild", vc)
+
+	vc.RLock()
+	channelID := vc.ChannelID
+	vc.RUnlock()
+	if channelID != "" {
+		t.Fatalf("ChannelID = %q, want empty", channelID)
+	}
+	if _, ok := s.VoiceConnections["guild"]; ok {
+		t.Fatal("VoiceConnections still contains guild entry")
+	}
+}
+
 func TestIdleDisconnectTimeoutIsFiveMinutes(t *testing.T) {
 	if idleDisconnectTimeout != 5*time.Minute {
 		t.Fatalf("idleDisconnectTimeout = %s, want 5m0s", idleDisconnectTimeout)
