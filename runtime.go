@@ -45,6 +45,7 @@ const (
 	opusSendTimeout       = 2 * time.Second
 	opusSendPollInterval  = 20 * time.Millisecond
 	processOutputTailMax  = 2000
+	defaultMemWarnInterval = 30 * time.Second
 )
 
 const (
@@ -93,6 +94,9 @@ var (
 	streamSlotsMu        sync.Mutex
 	streamLogSeq         atomic.Uint64
 	playbackMemLogEvery  time.Duration
+	processMemLogEvery   time.Duration
+	processMemWarnRSS    uint64
+	processMemLogVerbose bool
 )
 
 func configureStreamLimiter(limit int) {
@@ -116,7 +120,7 @@ func streamSlotStats() (int, int) {
 	return len(slots), cap(slots)
 }
 
-func parsePlaybackMemLogInterval(value string) (time.Duration, error) {
+func parseOptionalPositiveDuration(value string) (time.Duration, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || value == "0" {
 		return 0, nil
@@ -135,6 +139,22 @@ func parsePlaybackMemLogInterval(value string) (time.Duration, error) {
 		return 0, fmt.Errorf("interval must be positive")
 	}
 	return interval, nil
+}
+
+func parsePlaybackMemLogInterval(value string) (time.Duration, error) {
+	return parseOptionalPositiveDuration(value)
+}
+
+func parseOptionalPositiveMegabytes(value string) (uint64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "0" {
+		return 0, nil
+	}
+	mb, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || mb < 1 {
+		return 0, fmt.Errorf("megabytes must be positive")
+	}
+	return mb * 1024 * 1024, nil
 }
 
 func acquireStreamSlot(gs *guildState, generation uint64) (func(), time.Duration, bool) {
@@ -269,6 +289,78 @@ func logPlaybackMemSnapshot(event string, streamID uint64, guildID string, elaps
 		fields += fmt.Sprintf(" rss=%d", s.rss)
 	}
 	log.Print(fields)
+}
+
+func formatMemSnapshot(prefix, event string, s playbackMemSnapshot) string {
+	active, capacity := streamSlotStats()
+	fields := fmt.Sprintf(
+		"%s mem: event=%s active=%d capacity=%d goroutines=%d heap_alloc=%d heap_sys=%d heap_idle=%d heap_released=%d stack_inuse=%d next_gc=%d sys=%d num_gc=%d",
+		prefix,
+		event,
+		active,
+		capacity,
+		s.goroutines,
+		s.heapAlloc,
+		s.heapSys,
+		s.heapIdle,
+		s.heapReleased,
+		s.stackInuse,
+		s.nextGC,
+		s.sys,
+		s.numGC,
+	)
+	if s.hasRSS {
+		fields += fmt.Sprintf(" rss=%d", s.rss)
+	}
+	return fields
+}
+
+func startProcessMemMonitor() func() {
+	interval := processMemLogEvery
+	warnRSS := processMemWarnRSS
+	if interval <= 0 && warnRSS > 0 {
+		interval = defaultMemWarnInterval
+	}
+	if interval <= 0 {
+		return func() {}
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+	warned := false
+
+	safeGo("process memory monitor", func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s := capturePlaybackMemSnapshot()
+				if processMemLogVerbose {
+					log.Print(formatMemSnapshot("process", "tick", s))
+				}
+				if warnRSS > 0 && s.hasRSS {
+					if s.rss >= warnRSS && !warned {
+						log.Printf("%s warn_rss=%d", formatMemSnapshot("process", "rss_warning", s), warnRSS)
+						warned = true
+					} else if warned && s.rss < warnRSS*9/10 {
+						warned = false
+					}
+				}
+			case <-stop:
+				return
+			}
+		}
+	})
+
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
 }
 
 func startPlaybackMemLogger(streamID uint64, guildID string, started time.Time) func() {
