@@ -86,6 +86,7 @@ Environment variables override `config.json`:
 | `BOT_PREFIX` | Legacy prefix field |
 | `MAX_CONCURRENT_STREAMS` | Maximum simultaneous voice streams across all servers. Defaults to `5`. |
 | `PLAYBACK_MEM_LOG_INTERVAL` | Optional playback memory diagnostics interval, e.g. `30s`. Disabled by default. |
+| `YTMUSIC_SEARCH_BASE_URL` | Optional sidecar URL. Defaults to `http://127.0.0.1:5000`; Compose sets this to `http://search:5000`. |
 
 Keep secrets out of Git. `config.json` is ignored by this repo.
 
@@ -141,7 +142,44 @@ go build -a -o amogus.exe .
 
 ### Docker
 
-The Docker image builds the Go binary, installs `ffmpeg`, `yt-dlp`, and the Python search sidecar dependencies, then starts both the sidecar and the bot.
+The Docker image builds the Go binary and installs `ffmpeg`, `yt-dlp`, and the Python search sidecar dependencies.
+
+For a stable private local setup, use Compose. It runs the sidecar and the Discord bot as separate local services, restarts them unless you stop them, and exposes no public ports.
+
+Create your local environment file:
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Fill in `DISCORD_BOT_TOKEN` and `YOUTUBE_API_KEY`, then start it:
+
+```powershell
+docker compose up -d --build
+```
+
+Check logs:
+
+```powershell
+docker compose logs -f bot
+docker compose logs -f search
+```
+
+Stop it:
+
+```powershell
+docker compose down
+```
+
+Update dependencies and rebuild, including a fresh `yt-dlp` from `requirements.txt`:
+
+```powershell
+docker compose build --pull --no-cache
+docker compose up -d
+```
+
+You can still run the single-container image manually:
 
 ```bash
 docker build -t amogus .

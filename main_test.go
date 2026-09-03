@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -395,6 +396,23 @@ func TestParsePlaybackMemLogInterval(t *testing.T) {
 				t.Fatalf("parsePlaybackMemLogInterval(%q) = %s, want %s", tt.value, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestYTMusicSidecarURL(t *testing.T) {
+	t.Setenv("YTMUSIC_SEARCH_BASE_URL", "")
+
+	got := ytMusicSidecarURL("/search", url.Values{"q": []string{"hello world"}})
+	want := "http://127.0.0.1:5000/search?q=hello+world"
+	if got != want {
+		t.Fatalf("ytMusicSidecarURL default = %q, want %q", got, want)
+	}
+
+	t.Setenv("YTMUSIC_SEARCH_BASE_URL", "http://search:5000/")
+	got = ytMusicSidecarURL("radio", url.Values{"videoId": []string{"abc123"}})
+	want = "http://search:5000/radio?videoId=abc123"
+	if got != want {
+		t.Fatalf("ytMusicSidecarURL override = %q, want %q", got, want)
 	}
 }
 

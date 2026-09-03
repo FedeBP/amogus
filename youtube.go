@@ -10,11 +10,14 @@ import (
 	"google.golang.org/api/youtube/v3"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"time"
 )
+
+const defaultYTMusicSearchBaseURL = "http://127.0.0.1:5000"
 
 // searchCache caches YTMusic search results for 10 minutes to avoid
 // redundant HTTP round-trips to the Python sidecar during autocomplete.
@@ -91,6 +94,21 @@ func trackFromSearchResult(r SearchResult) Track {
 		Artist:   r.Artist,
 		Duration: r.Duration,
 	}
+}
+
+func ytMusicSidecarURL(path string, params url.Values) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("YTMUSIC_SEARCH_BASE_URL")), "/")
+	if baseURL == "" {
+		baseURL = defaultYTMusicSearchBaseURL
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	reqURL := baseURL + path
+	if len(params) > 0 {
+		reqURL += "?" + params.Encode()
+	}
+	return reqURL
 }
 
 // playedVideoIDsLocked returns a snapshot of tracks played in the current
@@ -277,7 +295,7 @@ func ytMusicSearch(ctx context.Context, query string) ([]SearchResult, error) {
 	}
 	searchCacheMu.Unlock()
 
-	reqURL := "http://127.0.0.1:5000/search?q=" + url.QueryEscape(query)
+	reqURL := ytMusicSidecarURL("/search", url.Values{"q": []string{query}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
@@ -317,7 +335,7 @@ func ytMusicRadio(ctx context.Context, videoID string) ([]SearchResult, error) {
 	params := url.Values{}
 	params.Set("videoId", videoID)
 
-	reqURL := "http://127.0.0.1:5000/radio?" + params.Encode()
+	reqURL := ytMusicSidecarURL("/radio", params)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err

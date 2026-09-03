@@ -1,3 +1,5 @@
+import os
+
 from flask import Flask, request, jsonify
 from waitress import serve
 from ytmusicapi import YTMusic
@@ -71,6 +73,13 @@ def radio():
 
     return jsonify(serialize_results(playlist.get("tracks", [])))
 
-print("YTMusic search backend started on :5000")
+@app.route("/healthz")
+def healthz():
+    return "ok"
 
-serve(app, host="127.0.0.1", port=5000, threads=4)
+host = os.environ.get("SEARCH_HOST", "127.0.0.1")
+port = int(os.environ.get("PORT", "5000"))
+
+print(f"YTMusic search backend started on {host}:{port}")
+
+serve(app, host=host, port=port, threads=4)

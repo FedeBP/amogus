@@ -2,6 +2,7 @@
 .gitignore
 *.md
 config.json
+.env
 audio.mp3*
 *.exe
 amogus
