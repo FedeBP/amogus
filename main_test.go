@@ -60,12 +60,13 @@ func TestResetPlaybackStateClearsAutoplayAndSessionState(t *testing.T) {
 	}
 }
 
-func TestPrepareUnexpectedVoiceLeaveRecoveryRequeuesCurrentTrack(t *testing.T) {
+func TestVoiceLeaveSnapshotCapturesContextAndClearsControls(t *testing.T) {
 	gs := &guildState{
 		songQueue: []Song{
 			{guildID: "guild", channelID: "voice", track: Track{URL: "https://www.youtube.com/watch?v=next"}},
 		},
 		isPlaying:           true,
+		autoplayEnabled:     true,
 		lastPlayed:          Track{URL: "https://www.youtube.com/watch?v=current", Title: "Current"},
 		lastVoiceChannelID:  "voice",
 		disconnectTimer:     time.AfterFunc(time.Hour, func() {}),
@@ -75,45 +76,49 @@ func TestPrepareUnexpectedVoiceLeaveRecoveryRequeuesCurrentTrack(t *testing.T) {
 	}
 	oldGeneration := gs.playbackGeneration.Load()
 
-	recovery, ok := gs.prepareUnexpectedVoiceLeaveRecovery("guild")
+	snapshot := gs.voiceLeaveSnapshot()
 
-	if !ok {
-		t.Fatal("prepareUnexpectedVoiceLeaveRecovery() ok = false, want true")
+	if !snapshot.isPlaying {
+		t.Fatal("isPlaying = false, want true")
 	}
-	if recovery.textChannelID != "text" {
-		t.Fatalf("textChannelID = %q, want text", recovery.textChannelID)
+	if !snapshot.autoplayEnabled {
+		t.Fatal("autoplayEnabled = false, want true")
 	}
-	if recovery.controls.channelID != "text" || recovery.controls.messageID != "message" {
-		t.Fatalf("controls = %#v, want text/message", recovery.controls)
+	if snapshot.lastVoiceChannelID != "voice" {
+		t.Fatalf("lastVoiceChannelID = %q, want voice", snapshot.lastVoiceChannelID)
 	}
-	if recovery.generation == oldGeneration || gs.playbackGeneration.Load() == oldGeneration {
-		t.Fatal("playbackGeneration did not change")
+	if snapshot.textChannelID != "text" {
+		t.Fatalf("textChannelID = %q, want text", snapshot.textChannelID)
 	}
-	if len(gs.songQueue) != 2 {
-		t.Fatalf("songQueue length = %d, want 2", len(gs.songQueue))
+	if snapshot.currentTrack != "Current" {
+		t.Fatalf("currentTrack = %q, want Current", snapshot.currentTrack)
 	}
-	if gs.songQueue[0].track.URL != "https://www.youtube.com/watch?v=current" {
-		t.Fatalf("first queued URL = %q, want current track", gs.songQueue[0].track.URL)
+	if snapshot.currentURL != "https://www.youtube.com/watch?v=current" {
+		t.Fatalf("currentURL = %q, want current track URL", snapshot.currentURL)
 	}
-	if gs.songQueue[1].track.URL != "https://www.youtube.com/watch?v=next" {
-		t.Fatalf("second queued URL = %q, want next track", gs.songQueue[1].track.URL)
+	if snapshot.queueLen != 1 {
+		t.Fatalf("queueLen = %d, want 1", snapshot.queueLen)
+	}
+	if snapshot.controls.channelID != "text" || snapshot.controls.messageID != "message" {
+		t.Fatalf("controls = %#v, want text/message", snapshot.controls)
+	}
+	if gs.playbackGeneration.Load() != oldGeneration {
+		t.Fatal("playbackGeneration changed")
+	}
+	if len(gs.songQueue) != 1 {
+		t.Fatalf("songQueue length = %d, want 1", len(gs.songQueue))
+	}
+	if gs.songQueue[0].track.URL != "https://www.youtube.com/watch?v=next" {
+		t.Fatalf("first queued URL = %q, want next track", gs.songQueue[0].track.URL)
 	}
 	if !gs.isPlaying {
 		t.Fatal("isPlaying = false, want true")
 	}
-	if gs.disconnectTimer != nil {
-		t.Fatal("disconnectTimer was not cleared")
+	if gs.disconnectTimer == nil {
+		t.Fatal("disconnectTimer was cleared")
 	}
 	if gs.nowPlayingChannelID != "" || gs.nowPlayingMessageID != "" || gs.nowPlayingControlID != "" {
 		t.Fatalf("now playing controls = %q/%q/%q, want cleared", gs.nowPlayingChannelID, gs.nowPlayingMessageID, gs.nowPlayingControlID)
-	}
-}
-
-func TestPrepareUnexpectedVoiceLeaveRecoveryRequiresActiveTrack(t *testing.T) {
-	gs := &guildState{isPlaying: true, lastVoiceChannelID: "voice", nowPlayingChannelID: "text"}
-
-	if _, ok := gs.prepareUnexpectedVoiceLeaveRecovery("guild"); ok {
-		t.Fatal("prepareUnexpectedVoiceLeaveRecovery() ok = true, want false without current track URL")
 	}
 }
 

@@ -216,6 +216,8 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 			_, _ = s.ChannelMessageSend(textChannelID, fmt.Sprintf("Could not join voice: %v", err))
 			return
 		}
+		log.Printf("voice join succeeded: id=%d guild=%s voice=%s %s",
+			streamID, guildID, song.channelID, voiceConnectionSendState(vc))
 
 		sendNowPlayingEmbed(s, gs, textChannelID, song.track)
 
@@ -229,8 +231,8 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 		activeSlots, slotCapacity = streamSlotStats()
 		reason := streamEndReason(err, interrupted, generationChanged)
 		if err != nil {
-			log.Printf("stream audio end: id=%d guild=%s reason=%s duration=%s active=%d capacity=%d err=%v",
-				streamID, guildID, reason, time.Since(streamStarted).Round(time.Millisecond), activeSlots, slotCapacity, err)
+			log.Printf("stream audio end: id=%d guild=%s reason=%s duration=%s active=%d capacity=%d %s err=%v",
+				streamID, guildID, reason, time.Since(streamStarted).Round(time.Millisecond), activeSlots, slotCapacity, voiceConnectionSendState(vc), err)
 		}
 		if err != nil {
 			if gs.playbackGeneration.Load() != generation {
@@ -241,8 +243,8 @@ func playNextSong(s *discordgo.Session, guildID, textChannelID string, generatio
 				_, _ = s.ChannelMessageSend(textChannelID, "Skipped.")
 			} else {
 				if errors.Is(err, errOpusSendTimeout) {
-					log.Printf("voice local reset after send timeout: id=%d guild=%s voice=%s",
-						streamID, guildID, song.channelID)
+					log.Printf("voice local reset after send timeout: id=%d guild=%s voice=%s %s",
+						streamID, guildID, song.channelID, voiceConnectionSendState(vc))
 					closeLocalVoiceConnection(s, guildID, vc)
 				}
 				msg := "Playback error; skipping to next track."

@@ -247,42 +247,34 @@ func (gs *guildState) resetPlaybackState() {
 	gs.mu.Unlock()
 }
 
-type voiceLeaveRecovery struct {
-	textChannelID string
-	controls      nowPlayingMessageRef
-	generation    uint64
+type voiceLeaveSnapshot struct {
+	isPlaying          bool
+	autoplayEnabled    bool
+	lastVoiceChannelID string
+	textChannelID      string
+	currentTrack       string
+	currentURL         string
+	queueLen           int
+	controls           nowPlayingMessageRef
 }
 
-func (gs *guildState) prepareUnexpectedVoiceLeaveRecovery(guildID string) (voiceLeaveRecovery, bool) {
+func (gs *guildState) voiceLeaveSnapshot() voiceLeaveSnapshot {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 
-	if !gs.isPlaying ||
-		gs.lastVoiceChannelID == "" ||
-		gs.nowPlayingChannelID == "" ||
-		gs.lastPlayed.URL == "" {
-		return voiceLeaveRecovery{}, false
-	}
-
-	current := Song{
-		guildID:   guildID,
-		channelID: gs.lastVoiceChannelID,
-		track:     gs.lastPlayed,
-	}
-	gs.songQueue = append([]Song{current}, gs.songQueue...)
-	generation := gs.playbackGeneration.Add(1)
-	if gs.disconnectTimer != nil {
-		gs.disconnectTimer.Stop()
-		gs.disconnectTimer = nil
-	}
 	textChannelID := gs.nowPlayingChannelID
 	controls := gs.clearNowPlayingControlsLocked()
 
-	return voiceLeaveRecovery{
-		textChannelID: textChannelID,
-		controls:      controls,
-		generation:    generation,
-	}, true
+	return voiceLeaveSnapshot{
+		isPlaying:          gs.isPlaying,
+		autoplayEnabled:    gs.autoplayEnabled,
+		lastVoiceChannelID: gs.lastVoiceChannelID,
+		textChannelID:      textChannelID,
+		currentTrack:       trackLogLabel(gs.lastPlayed),
+		currentURL:         gs.lastPlayed.URL,
+		queueLen:           len(gs.songQueue),
+		controls:           controls,
+	}
 }
 
 // Guild-state registry.

@@ -9,6 +9,7 @@ func disconnectVoiceConnection(vc *discordgo.VoiceConnection) error {
 	if vc == nil {
 		return nil
 	}
+	log.Printf("voice disconnect requested: %s", voiceConnectionSendState(vc))
 	// discordgo may attempt to reconnect a VoiceConnection using its last
 	// ChannelID after transport errors. Clear it before closing local voice
 	// resources so an external kick or stop cannot auto-rejoin later.
@@ -22,6 +23,7 @@ func closeLocalVoiceConnection(s *discordgo.Session, guildID string, vc *discord
 	if vc == nil {
 		return
 	}
+	log.Printf("voice local close requested: guild=%s %s", guildID, voiceConnectionSendState(vc))
 	vc.Lock()
 	vc.ChannelID = ""
 	vc.Unlock()
@@ -62,37 +64,54 @@ func voiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
 		maybeDisconnectEmptyVoiceChannel(s, vs.GuildID)
 		return
 	}
+	previousChannelID := ""
+	if vs.BeforeUpdate != nil {
+		previousChannelID = vs.BeforeUpdate.ChannelID
+	}
 	if vs.ChannelID != "" {
+		log.Printf("Bot voice state update in guild %s: previous_voice=%s current_voice=%s session=%s deaf=%t mute=%t self_deaf=%t self_mute=%t suppress=%t",
+			vs.GuildID,
+			previousChannelID,
+			vs.ChannelID,
+			vs.SessionID,
+			vs.Deaf,
+			vs.Mute,
+			vs.SelfDeaf,
+			vs.SelfMute,
+			vs.Suppress,
+		)
 		return // bot joined or moved — not a leave event
 	}
 
 	gs := getGuildState(vs.GuildID)
 	wasIntentional := gs.intentionalLeave.CompareAndSwap(true, false)
-	previousChannelID := ""
-	if vs.BeforeUpdate != nil {
-		previousChannelID = vs.BeforeUpdate.ChannelID
-	}
-
 	if wasIntentional {
-		// Normal stop/idle disconnect path.
-	} else if recovery, ok := gs.prepareUnexpectedVoiceLeaveRecovery(vs.GuildID); ok {
-		log.Printf("Bot voice connection dropped in guild %s; reconnecting playback. previous_voice=%s", vs.GuildID, previousChannelID)
-		gs.killPlaybackProcesses()
-		clearNowPlayingMessageComponents(s, recovery.controls)
-		_, _ = s.ChannelMessageSend(recovery.textChannelID, "Voice connection dropped; reconnecting and restarting the current track.")
-
-		s.RLock()
-		vc, ok := s.VoiceConnections[vs.GuildID]
-		s.RUnlock()
-		if ok && vc != nil {
-			closeLocalVoiceConnection(s, vs.GuildID, vc)
-		}
-		safeGo("playback recovery", func() {
-			playNextSong(s, vs.GuildID, recovery.textChannelID, recovery.generation)
-		})
-		return
+		log.Printf("Bot left voice intentionally in guild %s: previous_voice=%s session=%s", vs.GuildID, previousChannelID, vs.SessionID)
 	} else {
-		log.Printf("Bot was removed from voice in guild %s; clearing playback state. previous_voice=%s", vs.GuildID, previousChannelID)
+		snapshot := gs.voiceLeaveSnapshot()
+		log.Printf("Bot left voice unexpectedly in guild %s; stopping playback. previous_voice=%s session=%s deaf=%t mute=%t self_deaf=%t self_mute=%t suppress=%t last_voice=%s playing=%t autoplay=%t queue=%d current=%q url=%s text=%s controls=%s/%s",
+			vs.GuildID,
+			previousChannelID,
+			vs.SessionID,
+			vs.Deaf,
+			vs.Mute,
+			vs.SelfDeaf,
+			vs.SelfMute,
+			vs.Suppress,
+			snapshot.lastVoiceChannelID,
+			snapshot.isPlaying,
+			snapshot.autoplayEnabled,
+			snapshot.queueLen,
+			snapshot.currentTrack,
+			snapshot.currentURL,
+			snapshot.textChannelID,
+			snapshot.controls.channelID,
+			snapshot.controls.messageID,
+		)
+		clearNowPlayingMessageComponents(s, snapshot.controls)
+		if snapshot.textChannelID != "" && snapshot.isPlaying {
+			_, _ = s.ChannelMessageSend(snapshot.textChannelID, "Voice connection dropped; playback stopped to avoid a reconnect loop. Use `/play` to start again.")
+		}
 	}
 
 	gs.resetPlaybackState()
