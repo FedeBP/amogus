@@ -15,17 +15,15 @@ import (
 
 type configStruct struct {
 	Token                string `json:"token"`
-	BotPrefix            string `json:"botPrefix"`
 	APIKey               string `json:"APIKey"`
 	MaxConcurrentStreams int    `json:"MAX_CONCURRENT_STREAMS"`
 }
 
 var (
-	Token     string
-	BotPrefix string
-	APIKey    string
-	config    *configStruct
-	BotID     string
+	Token  string
+	APIKey string
+	config *configStruct
+	BotID  string
 )
 
 // GetConfig loads file-backed settings, applies environment overrides, and
@@ -42,7 +40,6 @@ func GetConfig() {
 	}
 
 	Token = strings.TrimSpace(fileCfg.Token)
-	BotPrefix = strings.TrimSpace(fileCfg.BotPrefix)
 	APIKey = strings.TrimSpace(fileCfg.APIKey)
 
 	if v := strings.TrimSpace(os.Getenv("DISCORD_BOT_TOKEN")); v != "" {
@@ -50,9 +47,6 @@ func GetConfig() {
 	}
 	if v := strings.TrimSpace(os.Getenv("YOUTUBE_API_KEY")); v != "" {
 		APIKey = v
-	}
-	if v := strings.TrimSpace(os.Getenv("BOT_PREFIX")); v != "" {
-		BotPrefix = v
 	}
 	maxStreams := fileCfg.MaxConcurrentStreams
 	if v := strings.TrimSpace(os.Getenv("MAX_CONCURRENT_STREAMS")); v != "" {
@@ -67,9 +61,6 @@ func GetConfig() {
 		log.Fatalf("PLAYBACK_MEM_LOG_INTERVAL must be a Go duration like 30s or a positive number of seconds, got %q", os.Getenv("PLAYBACK_MEM_LOG_INTERVAL"))
 	}
 
-	if BotPrefix == "" {
-		BotPrefix = "&"
-	}
 	if Token == "" {
 		log.Fatal("Missing Discord token: set DISCORD_BOT_TOKEN or 'token' in config.json")
 	}
@@ -82,7 +73,6 @@ func GetConfig() {
 
 	config = &configStruct{
 		Token:                Token,
-		BotPrefix:            BotPrefix,
 		APIKey:               APIKey,
 		MaxConcurrentStreams: maxConcurrentStreams,
 	}

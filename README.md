@@ -72,7 +72,6 @@ Create `config.json` next to the executable, or run from the repo root:
 ```json
 {
   "token": "your-discord-bot-token",
-  "botPrefix": "&",
   "APIKey": "your-youtube-data-api-v3-key"
 }
 ```
@@ -83,7 +82,6 @@ Environment variables override `config.json`:
 |----------|---------|
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `YOUTUBE_API_KEY` | YouTube Data API v3 key |
-| `BOT_PREFIX` | Legacy prefix field |
 | `MAX_CONCURRENT_STREAMS` | Maximum simultaneous voice streams across all servers. Defaults to `5`. |
 | `PLAYBACK_MEM_LOG_INTERVAL` | Optional playback memory diagnostics interval, e.g. `30s`. Disabled by default. |
 | `YTMUSIC_SEARCH_BASE_URL` | Optional sidecar URL. Defaults to `http://127.0.0.1:5000`; Compose sets this to `http://search:5000`. |
@@ -197,17 +195,14 @@ This bot needs a long-running process for the Discord gateway and voice connecti
 
 Within one bot process, music actions are serialized per Discord server so requests from one server do not overlap each other and requests from different servers can still proceed independently. Active audio pipelines are also capped globally by `MAX_CONCURRENT_STREAMS`; with the default of `5`, five servers can stream at the same time and any additional server waits until a stream slot opens.
 
-For temporary Fly memory profiling, set `PLAYBACK_MEM_LOG_INTERVAL=30s` and run a few concurrent streams. The bot logs `playback mem` snapshots at stream start, at each interval, and at stream end with Go heap, GC, goroutine, stream slot, and Linux RSS fields when available.
-
-For Fly.io, run one active machine per Discord bot token unless you add sharding or leader election. Multiple identical machines can receive the same interactions and fight over voice state. Use `fly scale count 1` for the current single-process bot.
+For temporary memory profiling, set `PLAYBACK_MEM_LOG_INTERVAL=30s` and run a few concurrent streams. The bot logs `playback mem` snapshots at stream start, at each interval, and at stream end with Go heap, GC, goroutine, stream slot, and Linux RSS fields when available.
 
 Reasonable options:
 
 | Host | Notes |
 |------|-------|
 | Render | Use a paid Background Worker. Free web services sleep. |
-| Oracle Cloud Free Tier | See [docs/oracle-cloud.md](docs/oracle-cloud.md). |
-| Fly.io / Railway / other PaaS | Use Docker and configure secrets in the dashboard. Confirm the plan does not sleep. |
+| Railway / other PaaS | Use Docker and configure secrets in the dashboard. Confirm the plan does not sleep. |
 
 ## Troubleshooting
 
